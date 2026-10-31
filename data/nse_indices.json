@@ -1,0 +1,19 @@
+{
+  "_meta": {
+    "source": "Tickertape / Dhan / Wikipedia (cross-verified May 2026)",
+    "rebalance_due": "next semi-annual NSE review",
+    "note": "Update this file when the NSE publishes the next rebalance. The asserts in symbol_universe.py will catch length drift."
+  },
+  "nifty_50": [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+    "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", "BEL", "BHARTIARTL",
+    "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL",
+    "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO",
+    "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC",
+    "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT", "M&M",
+    "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
+    "SUNPHARMA", "TATACONSUM", "TATASTEEL", "TCS", "TECHM",
+    "TITAN", "TMPV", "TRENT", "ULTRACEMCO", "WIPRO"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "_comment": "Supplemental concall transcript PDF URLs not present in screener.in's index (e.g. old quarters recovered via the Wayback Machine). Keyed by NSE symbol; consumed by ingest_concalls.py so delete+re-run stays reproducible.",
+  "TCS": [
+    "https://www.tcs.com/content/dam/tcs/investor-relations/financial-statements/2015-16/q2/Management%20Commentary/Transcript%20of%20the%20Q2%202015-16%20Earnings%20Conference%20Call%20held%20at%2019%2000%20hrs%20IST%20on%20Oct%2013,%202015.pdf"
+  ]
+}

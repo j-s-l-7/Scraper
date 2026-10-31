@@ -1,0 +1,62 @@
+name: Equity shards (screener + yfinance)
+
+# Splits the universe by rank across N slices; each runner (own IP) does its slice end-to-end.
+# Slices this workflow does not run (e.g. the last one) are taken by the local machine.
+# Both commands upsert and resume, so re-running a slice is safe.
+on:
+  workflow_dispatch:
+    inputs:
+      total:
+        description: 'total slices (GitHub runs slices 1..10; the rest run locally)'
+        default: '11'
+      universe:
+        default: 'TOP100_MCAP'
+
+concurrency:
+  group: equity-shards
+  cancel-in-progress: false
+
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SLICE: ${{ matrix.shard }}/${{ inputs.total }}
+      UNIVERSE: ${{ inputs.universe }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # screener.in and Yahoo are different hosts, so both run at once without sharing a rate limit.
+      - name: screener.in + yfinance for this slice
+        run: |
+          mkdir -p logs
+          python -m screener_scraper yf --universe "$UNIVERSE" --shard "$SLICE" > logs/yf.log 2>&1 &
+          YF_PID=$!
+          set +e
+          python -m screener_scraper scrape --universe "$UNIVERSE" --shard "$SLICE" 2>&1 | tee logs/screener.log
+          S=${PIPESTATUS[0]}
+          wait $YF_PID; Y=$?
+          echo "---- yfinance log (tail) ----"; tail -40 logs/yf.log
+          echo "screener exit=$S yf exit=$Y"
+          exit $(( S != 0 || Y != 0 ))
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-shard-${{ matrix.shard }}
+          path: logs/
+          retention-days: 7

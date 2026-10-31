@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# Secrets - NEVER commit
+.env
+.env.local
+.env.*.local
+
+# Claude Code: local settings stay private; project skills are committed
+.claude/*
+!.claude/skills/
+
+# Runtime data (large / regenerable)
+# raw screener responses (re-parse cache) and extracted AR/concall text (jsonl.gz per doc)
+data/raw/
+data/documents/
+logs/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Supabase CLI scratch
+supabase/.temp/

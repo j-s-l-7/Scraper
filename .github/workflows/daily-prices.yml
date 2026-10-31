@@ -1,0 +1,48 @@
+name: Daily prices (Nifty 50 + top-100 OHLCV)
+
+# 11:30 UTC = 17:00 IST. Mon-Fri only (1-5 in cron weekday).
+# GitHub Actions cron can drift 5-15 min during high-traffic windows
+# — we deliberately fire 90 min after the 15:30 IST NSE close, so any
+# drift still lands after yfinance has consolidated the day's bar.
+on:
+  schedule:
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch:  # allow manual triggering from the Actions tab
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 1 — yfinance: full OHLCV write over the recent window. This is
+      # the fallback layer (always runs, full coverage) and the owner of the
+      # split/dividend-adjusted `adj_close` column, which the bhavcopy lacks.
+      - name: yfinance ingest (base + adj_close, period=5d)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python ingestion/ingest_yfinance.py --universe TOP100_MCAP --period 5d
+
+      # Step 2 — NSE bhavcopy: the exchange's own EOD record, now the
+      # PRIMARY source for traded OHLCV+volume. --keep-adj-close overwrites
+      # price/volume but preserves the adj_close set in step 1. Runs second
+      # so its authoritative values win. `continue-on-error` keeps yfinance's
+      # write authoritative if NSE is unreachable that day.
+      - name: NSE bhavcopy ingest (primary OHLCV, keep adj_close)
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python ingestion/backfill_from_nse.py --universe TOP100_MCAP --recent 7 --keep-adj-close
