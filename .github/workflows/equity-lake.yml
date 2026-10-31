@@ -1,0 +1,78 @@
+name: equity-lake
+run-name: lake ${{ inputs.from_rank }}-${{ inputs.to_rank }}${{ inputs.ranks && ' (retry)' || '' }}
+
+# 20 runners work on ~20 consecutive ranks at a time. Each runner has its own Postgres (service container),
+# exports CSVs after every company and uploads them as artifact lake-<run_id>-<k>; `lake-load` merges them
+# into the local lake. Supabase is only read (seeding the slice).
+on:
+  workflow_dispatch:
+    inputs:
+      from_rank:
+        description: "first rank of the window"
+        required: true
+      to_rank:
+        description: "last rank of the window"
+        required: true
+      ranks:
+        description: "optional explicit comma list of ranks (retry windows); overrides from/to"
+        required: false
+        default: ""
+
+concurrency:
+  group: equity-lake
+  cancel-in-progress: false
+
+jobs:
+  lake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        k: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lake
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://localhost:5432/lake      # user/password come from the libpq PG* variables
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      SOURCE_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: OCR + audio tools
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr ffmpeg
+      - run: pip install -r requirements.txt
+      - name: Apply migrations to the runner-local Postgres
+        run: python -m screener_scraper init-db
+      - name: Slice ${{ matrix.k }}/20 of ${{ inputs.from_rank }}-${{ inputs.to_rank }}
+        run: |
+          python -m screener_scraper lake-runner --from-rank "${{ inputs.from_rank }}" --to-rank "${{ inputs.to_rank }}" \
+            --k ${{ matrix.k }} --n 20 --ranks "${{ inputs.ranks }}" --out lake-out --max-minutes 315
+      - name: Add extracted document text to the artifact
+        if: always()
+        run: |
+          mkdir -p lake-out
+          [ -d data/documents ] && cp -R data/documents lake-out/documents || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lake-${{ github.run_id }}-${{ matrix.k }}
+          path: lake-out/
+          retention-days: 14
+          if-no-files-found: ignore

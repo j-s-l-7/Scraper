@@ -30,6 +30,10 @@ for id in $(gh run list -R "$REPO" -w equity-docs.yml -s completed -L 20 --json 
   if "$PY" -m screener_scraper collect-documents "$id"; then echo "$id" >> "$DONE"; fi
 done
 
+# 1b. lake rollout driver (top 1000): load finished equity-lake runs, retry gaps once, dispatch the next window,
+#     daily top-100 sync + equity-docs, weekly equity-shards. Idempotent; never fails; logs one summary line.
+"$PY" -m screener_scraper lake-drive 2>&1 | tail -n 3 || true
+
 # 2. library index (incremental; skips docs whose file isn't local yet)
 [ -d library ] && "$PY" -m library.index || echo "library index skipped/failed"
 

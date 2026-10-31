@@ -6,6 +6,9 @@ on:
       total:
         description: "Total number of shards the universe is split into (the matrix runs shards 1..10)"
         default: "11"
+      retry_missing:
+        description: "also retry missing/failed documents through the wayback / company-site fallback chain"
+        default: "false"
 
 concurrency:
   group: equity-docs
@@ -33,7 +36,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Documents shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }}
         run: |
-          python -m screener_scraper docs --universe TOP100_MCAP --shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }} --slots 4 --kinds annual_report,concall_transcript,concall_ppt
+          python -m screener_scraper docs --universe TOP100_MCAP --shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }} --slots 4 --kinds annual_report,concall_transcript,concall_ppt ${{ github.event.inputs.retry_missing == 'true' && '--retry-missing' || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

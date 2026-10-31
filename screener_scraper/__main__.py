@@ -119,10 +119,44 @@ def main(argv=None) -> int:
     cd.add_argument("--repo", help="default env GH_REPO or j-s-l-7/Scraper")
     ld = sub.add_parser("load-documents", help="bulk-load local jsonl.gz into equity.document_page (needs a bigger DB)")
     ld.add_argument("--limit", type=int)
+    sub.add_parser("lake-up", help="start the local Postgres lake (port 5433) if down; init + migrate; idempotent")
+    ll = sub.add_parser("lake-load", help="download lake-<run_id>-* artifacts of an equity-lake run and load them")
+    ll.add_argument("run_id", type=int)
+    sub.add_parser("lake-drive", help="unattended tick: load finished runs, retry gaps, dispatch next window (never fails)")
+    sub.add_parser("lake-start", help="lake-up, ensure TOP1000_MCAP is ranked, dispatch the first window")
+    lr = sub.add_parser("lake-runner", help="(GitHub runner) seed slice, scrape+yf+docs per company, export CSVs")
+    lr.add_argument("--from-rank", type=int, required=True)
+    lr.add_argument("--to-rank", type=int, required=True)
+    lr.add_argument("--k", type=int, required=True)
+    lr.add_argument("--n", type=int, default=20)
+    lr.add_argument("--ranks", help="explicit comma list of ranks (retry windows)")
+    lr.add_argument("--out", default="lake-out")
+    lr.add_argument("--max-minutes", type=float, default=310)
+    rc = sub.add_parser("rank-candidates", help="(GitHub runner) market cap of a slice of NSE EQUITY_L -> universe_candidate")
+    rc.add_argument("--shard", required=True, help="k/n")
+    rc.add_argument("--limit", type=int)
+    rf = sub.add_parser("rank-finalize", help="universe_candidate -> equity.universe TOP1000_MCAP")
+    rf.add_argument("--top", type=int, default=1000)
+    rf.add_argument("--min", type=int, default=0, dest="min_candidates")
     rp = sub.add_parser("report", help="write reports/<batch>.md from the job tables")
     rp.add_argument("--batch", required=True)
     a = ap.parse_args(argv)
     setup_logging()
+
+    if a.cmd == "lake-drive":                 # unattended: no Supabase connection needed up front, never fails
+        from .lake_drive import lake_drive_cli
+        return lake_drive_cli()
+    if a.cmd == "lake-up":
+        from .lake import lake_up
+        print(lake_up())
+        return 0
+    if a.cmd == "lake-load":
+        from .lake_drive import load_run
+        print(load_run(a.run_id))
+        return 0
+    if a.cmd == "lake-start":
+        from .lake_drive import lake_start
+        return lake_start()
 
     from .db import DB
     db = DB()
@@ -191,6 +225,17 @@ def main(argv=None) -> int:
         elif a.cmd == "load-documents":
             from .documents import load_documents
             print(load_documents(db, a.limit))
+        elif a.cmd == "lake-runner":
+            from pathlib import Path
+            from .lake_runner import run_lake_runner
+            return run_lake_runner(a.from_rank, a.to_rank, a.k, a.n, a.ranks, Path(a.out), a.max_minutes)
+        elif a.cmd == "rank-candidates":
+            from .rank import run_rank_candidates
+            return 0 if run_rank_candidates(db, config.parse_shard(a.shard), a.limit) != "failed" else 1
+        elif a.cmd == "rank-finalize":
+            from .rank import run_rank_finalize
+            n = run_rank_finalize(db, a.top, min_candidates=a.min_candidates)
+            print("ranked", n)
         elif a.cmd == "report":
             from .supervisor import write_report
             print(write_report(db, a.batch))
