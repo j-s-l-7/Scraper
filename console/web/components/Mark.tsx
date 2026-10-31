@@ -4,8 +4,8 @@ export function Marked({ text }: { text: string }) {
   const parts = text.split(/(<mark>.*?<\/mark>)/g);
   return <>{parts.map((p, i) => p.startsWith("<mark>") ? <mark key={i}>{p.slice(6, -7)}</mark> : <React.Fragment key={i}>{p}</React.Fragment>)}</>;
 }
-const SUFFIX = /(ements|ement|ations|ation|ings|ing|ies|ied|ers|er|ed|es|s|e|y)$/;
-export function stemOf(w: string) { const m = w.match(SUFFIX); return m && w.length - m[0].length >= 3 ? w.slice(0, w.length - m[0].length) : w; }
+const SUFFIXES = ["ements", "ement", "ations", "ation", "ings", "ing", "ies", "ied", "ers", "er", "ed", "es", "s", "e", "y"];
+export function stemOf(w: string) { for (const x of SUFFIXES) if (w.endsWith(x) && w.length - x.length >= 3) return w.slice(0, w.length - x.length); return w; }
 /** Highlights query terms (stem-prefix match, like the search index) in plain text. */
 export function Highlight({ text, terms }: { text: string; terms: string[] }) {
   const ts = terms.map((t) => t.toLowerCase().replace(/[^a-z0-9]/g, "")).filter((t) => t.length >= 2).map(stemOf);

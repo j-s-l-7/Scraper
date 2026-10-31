@@ -8,8 +8,8 @@ import { Empty, ErrorBox, Skeleton, StatusPill } from "@/components/ui";
 import { Highlight } from "@/components/Mark";
 
 type Doc = { meta: { symbol: string; name: string; doc_type: string; period_label: string | null; fiscal_year: number | null; url: string; fetched_url: string | null; status: string; source: string | null;
-  fetch_source: string | null; page_count: number | null; char_count: number | null; doc_date: string | null; extractor: string | null }; total_pages: number | null; pages: { page: number; text: string }[]; available: boolean };
-type Find = { total: number; pages: { page: number; count: number; snippet: string }[] };
+  fetch_source: string | null; page_count: number | null; char_count: number | null; doc_date: string | null; extractor: string | null; citation: string }; total_pages: number | null; pages: { page: number; text: string }[]; available: boolean };
+type Find = { terms: string[]; total: number; pages: { page: number; count: number; snippet: string }[] };
 
 function Inner() {
   const sp = useSearchParams(), router = useRouter();
@@ -20,23 +20,26 @@ function Inner() {
   const [jump, setJump] = useState(String(page));
   const [res, setRes] = useState<Find | null>(null);
   const [copied, setCopied] = useState(false);
+  const [findErr, setFindErr] = useState<string | null>(null);
   const { data, error, loading } = useApi<Doc>(key ? `/api/documents/${key}?page=${page}&limit=1` : null);
   const total = data?.total_pages ?? 0;
   const go = useCallback((p: number) => router.replace(`/doc/${qs({ key, page: Math.min(Math.max(1, p), total || p), q })}`), [router, key, q, total]);
   useEffect(() => setJump(String(page)), [page]);
   useEffect(() => {
-    const on = (e: KeyboardEvent) => { const t = e.target as HTMLElement; if (t.tagName === "INPUT") return; if (e.key === "j" || e.key === "ArrowRight") go(page + 1); if (e.key === "k" || e.key === "ArrowLeft") go(page - 1); };
+    const on = (e: KeyboardEvent) => { const t = e.target as HTMLElement; if (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.isContentEditable || e.metaKey || e.ctrlKey || e.altKey) return; if (e.key === "j" || e.key === "ArrowRight") go(page + 1); if (e.key === "k" || e.key === "ArrowLeft") go(page - 1); };
     window.addEventListener("keydown", on); return () => window.removeEventListener("keydown", on);
   }, [go, page]);
   useEffect(() => {
-    if (!q.trim() || !key) { setRes(null); return; }
-    let live = true; getJSON<Find>(`/api/documents/${key}/find${qs({ q })}`).then((r) => live && setRes(r)).catch(() => {}); return () => { live = false; };
+    setRes(null); setFindErr(null);
+    if (!q.trim() || !key) return;
+    let live = true; getJSON<Find>(`/api/documents/${key}/find${qs({ q })}`).then((r) => live && setRes(r)).catch((e) => live && setFindErr(String(e.message ?? e))); return () => { live = false; };
   }, [q, key]);
   if (!key) return <Empty title="No document" hint={<Link className="underline" href="/library/">Open the library</Link>} />;
   if (error) return <ErrorBox error={error} />;
   if (!data) return loading ? <Skeleton h={500} /> : null;
-  const m = data.meta, terms = q.match(/"[^"]+"|\S+/g)?.map((t) => t.replace(/"/g, "")).flatMap((t) => t.split(/\s+/)) ?? [];
-  const cite = `${m.symbol} · ${DOC_LABEL[m.doc_type] ?? m.doc_type} · ${m.doc_type === "annual_report" ? `FY${m.fiscal_year}` : m.period_label} · p.${page}\n${m.url}`;
+  const m = data.meta, terms = res?.terms ?? [];
+  const cite = `${m.citation}
+${m.url}`;
   return (
     <div className="grid gap-4 lg:grid-cols-[300px_1fr]">
       <aside className="space-y-3 lg:sticky lg:top-14 lg:self-start">
@@ -58,6 +61,7 @@ function Inner() {
             <button type="button" className="btn" onClick={() => go(page + 1)} disabled={page >= total}>›</button>
           </form>
           <input data-search className="input w-full" placeholder="Find in document   ( / )" value={find} onChange={(e) => setFind(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") router.replace(`/doc/${qs({ key, page, q: find })}`); }} />
+          {findErr && <div className="text-bad">Find failed: {findErr}</div>}
           {res && <div className="text-muted">{res.total} matches on {res.pages.length} pages</div>}
           <div className="max-h-72 space-y-1 overflow-auto">
             {res?.pages.map((r) => <button key={r.page} className={`block w-full rounded-md p-1.5 text-left hover:bg-surface-2 ${r.page === page ? "bg-surface-2" : ""}`} onClick={() => go(r.page)}><b>p.{r.page}</b> <span className="text-muted">×{r.count}</span><div className="line-clamp-2 text-[11.5px] text-muted">{r.snippet}</div></button>)}

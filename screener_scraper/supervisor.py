@@ -337,6 +337,11 @@ def build_report(db: DB, batch: str, events: Optional[List[str]] = None, outcome
         L.append(_fmt_table(["symbol", "gaps"], gaps) if gaps else "none")
     except Exception as e:
         L.append(f"coverage unavailable: {type(e).__name__}: {e}")
+    try:
+        from .quality import report_section
+        L.append(report_section(conn))
+    except Exception:
+        pass
     if events:
         L += ["", "## Supervisor events", "```"] + events[-300:] + ["```"]
     return "\n".join(L) + "\n"

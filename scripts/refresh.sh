@@ -34,6 +34,9 @@ done
 #     daily top-100 sync + equity-docs, weekly equity-shards. Idempotent; never fails; logs one summary line.
 "$PY" -m screener_scraper lake-drive 2>&1 | tail -n 3 || true
 
+# 1c. data-quality engine: checks + bounded auto-remediation + scorecard; once per day per DB (marker in equity.control)
+"$PY" -m screener_scraper dq --db both 2>&1 | tail -n 2 | cut -c1-400 || true
+
 # 2. library index (incremental; skips docs whose file isn't local yet)
 [ -d library ] && "$PY" -m library.index || echo "library index skipped/failed"
 

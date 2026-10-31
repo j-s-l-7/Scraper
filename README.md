@@ -58,3 +58,20 @@ select h.name, sh.period_end, sh.pct from equity.shareholding_holder sh join equ
 Notes: `basis` C = consolidated, S = standalone (`company.has_consolidated=false` means only S exists).
 `period_type`: Q quarter, A fiscal year, TTM (period_end = latest quarter end), H half-year balance sheet column.
 Schedules (drill-downs) appear as `Parent › Child` in `v_financials.line_item`.
+
+## Console
+
+An internal, read-only web app for browsing the top-100 data, annual reports and concalls (spec: `ARCHITECTURE.md` section 9).
+
+```bash
+.venv/bin/python -m library.index     # build/update data/library.sqlite (incremental; re-run as document files land)
+.venv/bin/python -m console           # builds console/web if stale, serves http://127.0.0.1:8787
+.venv/bin/python -m console --build   # force npm ci + build;  --dev runs next dev on :3000 with the API on :8787
+```
+
+Pages: Securities, Company (`/company/?s=TCS`, 7 tabs), Reader (`/doc/?key=...`), Library search, Ops. Shortcuts: `/`, `g s`, `g l`, `g o`, `t`, `?`.
+
+## Top-1000 rollout (local lake)
+`lake-up` (Postgres on :5433, db `equity_lake`, `LAKE_DATABASE_URL`), `lake-start` (rank via `equity-rank.yml`, then first window),
+`lake-drive` (unattended tick, run by `scripts/refresh.sh`), `lake-load <run_id>`. Workflows: `equity-rank.yml`,
+`equity-lake.yml` (20 runners, windows 101-400 / 401-700 / 701-1000). Lake bookkeeping: `lake_window`, `lake_load_log`, `lake_state`.

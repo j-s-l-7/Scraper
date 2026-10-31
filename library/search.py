@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 from .index import DEFAULT_DB, dtype_token, fy_token, sym_token
 
 MAX_LIMIT = 50
 MAX_TERMS = 8
+POOL = 300
 MARK_OPEN, MARK_CLOSE = "<mark>", "</mark>"
 DOC_TYPE_LABEL = {"annual_report": "Annual Report", "concall_transcript": "Concall", "concall_ppt": "Concall PPT"}
 
@@ -133,9 +135,35 @@ def _hit(r: sqlite3.Row, score: float, strict: bool) -> dict:
     }
 
 
+_POOL_CACHE: dict = {}
+POOL_TTL = 300.0
+
+
+def _ranked_pool(con, db_path, strict_q: str, items) -> list[dict]:
+    """The best POOL bm25 strict matches, re-ranked so terms adjacent in order (a phrase) beat scattered terms.
+    Cached per (index file version, query) so paging slices the list instead of re-reading the texts."""
+    p = Path(db_path)
+    key = (str(p), p.stat().st_mtime_ns, strict_q)
+    hit = _POOL_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < POOL_TTL:
+        return hit[1]
+    pool = con.execute(_SQL.format(text="c.text as text,", exclude=""), (strict_q, POOL, 0)).fetchall()
+    words = [w for t, _ in items for w in t.split()]
+    adj = re.compile(r"\b" + r"\W+(?:\w+\W+)?".join(re.escape(_stem(w)) + r"\w*" for w in words), re.I)
+    scored = [(1.0 + max(_squash(r["rank"]), 0.001) * 0.5 + (0.5 if adj.search(r["text"]) else 0.0), r) for r in pool]
+    scored.sort(key=lambda t: -t[0])
+    ranked = [_hit(r, sc, True) for sc, r in scored]
+    if len(_POOL_CACHE) > 60:
+        _POOL_CACHE.clear()
+    _POOL_CACHE[key] = (time.monotonic(), ranked)
+    return ranked
+
+
 def search(q: str, symbols: list[str] | None = None, doc_types: list[str] | None = None, fy_from: int | None = None,
            fy_to: int | None = None, limit: int = 10, offset: int = 0, *, db_path: Path | str = DEFAULT_DB) -> dict:
-    """{"hits": [...], "total_strict": n, "terms": [...], "limit", "offset"}; hits are strict matches first."""
+    """{"hits": [...], "total_strict": n, "terms": [...], "limit", "offset"}; hits are strict matches first.
+    For multi-term queries the strict list is the best POOL (300) passages re-ranked by phrase adjacency, so
+    pagination is capped at POOL; single-term queries page through plain bm25 order."""
     limit = max(0, min(int(limit), MAX_LIMIT))
     offset = max(0, int(offset))
     items = parse_query(q)
@@ -149,10 +177,14 @@ def search(q: str, symbols: list[str] | None = None, doc_types: list[str] | None
         strict_q = build_match(items, relaxed=False, **flt)
         try:
             out["total_strict"] = con.execute("select count(*) from chunk_fts where chunk_fts match ?", (strict_q,)).fetchone()[0]
-            rows = con.execute(_SQL.format(text="", exclude=""), (strict_q, limit, offset)).fetchall()
+            if len(items) > 1:
+                ranked = _ranked_pool(con, db_path, strict_q, items)
+                hits = ranked[offset : offset + limit]  # pagination is capped at POOL ranked passages
+            else:
+                rows = con.execute(_SQL.format(text="", exclude=""), (strict_q, limit, offset)).fetchall()
+                hits = [_hit(r, 1.0 + max(_squash(r["rank"]), 0.001), True) for r in rows]
         except sqlite3.OperationalError:
             return out  # un-parseable query: no results rather than a 500
-        hits = [_hit(r, 1.0 + max(_squash(r["rank"]), 0.001), True) for r in rows]
         need = limit - len(hits)
         # relaxed top-up, only on the first page and only when strict ran dry
         if need > 0 and len(items) > 1 and offset + len(hits) >= out["total_strict"]:

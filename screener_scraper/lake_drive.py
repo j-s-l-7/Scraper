@@ -61,6 +61,18 @@ def ranks_str(ranks: List[int]) -> str:
     return ",".join(str(r) for r in sorted(ranks))
 
 
+def extra_windows(conn) -> List[Tuple[int, int]]:
+    """Windows beyond rank 1000 registered by the data-quality engine (lake_state 'extra_windows' = '1001-1300,...')."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select value from public.lake_state where key='extra_windows'")
+            r = cur.fetchone()
+        conn.rollback()
+        return [tuple(map(int, w.split("-"))) for w in (r[0] if r and r[0] else "").split(",") if w]
+    except Exception:
+        return []
+
+
 # ───────────────────────────── gh wrappers ─────────────────────────────
 def secrets_ready() -> bool:
     try:
@@ -242,7 +254,7 @@ def drive_once(allow_dispatch: bool = True) -> str:
                             "and status in ('dispatched','done','loaded','retried')")
                 done = [(a, b) for a, b in cur.fetchall()]
             conn.rollback()
-            w = next_window(done)
+            w = next_window(done, WINDOWS + extra_windows(conn))
             if w:
                 rid = dispatch("equity-lake.yml", {"from_rank": str(w[0]), "to_rank": str(w[1])})
                 with conn, conn.cursor() as cur:

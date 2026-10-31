@@ -107,6 +107,8 @@ def test_document_reader(client):
     assert j["pages"][0]["page"] == 1 and isinstance(j["pages"][0]["text"], str)
     f = get(client, f"/api/documents/{d['key']}/find?q=the")
     assert f["total"] > 0 and f["pages"][0]["page"] >= 1
+    assert get(client, f"/api/documents/{d['key']}/find?q=the+capital")["terms"] == ["capital"]
+    assert j["meta"]["citation"].startswith("TCS · ") and j["meta"]["citation"].endswith("p.1")
     get(client, "/api/documents/not-a-key", 404)
 
 

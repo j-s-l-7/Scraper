@@ -138,6 +138,9 @@ def main(argv=None) -> int:
     rf = sub.add_parser("rank-finalize", help="universe_candidate -> equity.universe TOP1000_MCAP")
     rf.add_argument("--top", type=int, default=1000)
     rf.add_argument("--min", type=int, default=0, dest="min_candidates")
+    dq = sub.add_parser("dq", help="daily data-quality run: checks, auto-remediation, scorecard (once per day per DB)")
+    dq.add_argument("--db", choices=["supabase", "lake", "both"], default="supabase")
+    dq.add_argument("--force", action="store_true", help="run even if it already ran today")
     rp = sub.add_parser("report", help="write reports/<batch>.md from the job tables")
     rp.add_argument("--batch", required=True)
     a = ap.parse_args(argv)
@@ -236,6 +239,9 @@ def main(argv=None) -> int:
             from .rank import run_rank_finalize
             n = run_rank_finalize(db, a.top, min_candidates=a.min_candidates)
             print("ranked", n)
+        elif a.cmd == "dq":
+            from .quality import dq_cli
+            return dq_cli(a.db, a.force)
         elif a.cmd == "report":
             from .supervisor import write_report
             print(write_report(db, a.batch))

@@ -118,3 +118,12 @@ def test_search_phrase_and_snippet_highlight(lib):
     assert {c["symbol"] for c in f["companies"]} == {"AAA"}
     assert lib_search.parse_query("What is the capital allocation?") == [("capital", False), ("allocation", False)]
     assert lib_search.query_terms('"free cash flow" dividends') == ["free", "cash", "flow", "dividends"]
+
+
+def test_paging_uses_one_ranking_and_is_capped(lib):
+    db = lib[0]
+    all_hits = lib_search.search("capital allocation", limit=50, db_path=db)["hits"]
+    p1 = lib_search.search("capital allocation", limit=1, offset=0, db_path=db)["hits"]
+    p2 = lib_search.search("capital allocation", limit=1, offset=1, db_path=db)["hits"]
+    assert [h["chunk_id"] for h in p1 + p2] == [h["chunk_id"] for h in all_hits[:2]]
+    assert lib_search.search("capital allocation", limit=5, offset=lib_search.POOL, db_path=db)["hits"] == []

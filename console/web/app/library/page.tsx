@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { getJSON, Hit, qs } from "@/lib/api";
 import { DOC_LABEL, fmt } from "@/lib/format";
@@ -21,20 +21,33 @@ function Inner() {
   const [busy, setBusy] = useState(false);
   const [stats, setStats] = useState<Res["stats"] | null>(null);
 
-  const push = (o: Record<string, string>) => router.replace(`/library/${qs({ q, symbols, types, fy_from: fyf, fy_to: fyt, ...o })}`);
+  const reqId = useRef(0);
+  const [lastBatch, setLastBatch] = useState(0);
+  // read the URL at call time, so a debounced push can never revert a filter changed meanwhile
+  const push = (o: Record<string, string>) => {
+    const cur = new URLSearchParams(window.location.search);
+    const base: Record<string, string> = { q: "", symbols: "", types: "", fy_from: "", fy_to: "" };
+    for (const k of Object.keys(base)) base[k] = cur.get(k) || "";
+    router.replace(`/library/${qs({ ...base, ...o })}`);
+  };
   useEffect(() => { getJSON<Res["stats"]>("/api/library/stats").then(setStats).catch(() => {}); }, []);
-  useEffect(() => { const id = setTimeout(() => { if (input !== q) push({ q: input }); }, 300); return () => clearTimeout(id); /* eslint-disable-next-line */ }, [input]);
+  useEffect(() => { const id = setTimeout(() => { if (input !== (new URLSearchParams(window.location.search).get("q") || "")) push({ q: input }); }, 300); return () => clearTimeout(id); /* eslint-disable-next-line */ }, [input]);
   useEffect(() => {
     if (!q.trim()) { setRes(null); setHits([]); return; }
-    let live = true; setBusy(true); setErr(null);
+    let live = true; setBusy(true); setErr(null); const my = ++reqId.current;
     getJSON<Res>(`/api/library/search${qs({ q, symbols, types, fy_from: fyf, fy_to: fyt, limit: 15 })}`)
-      .then((r) => { if (!live) return; setRes(r); setHits(r.hits); if (r.facets) setFacets(r.facets); })
+      .then((r) => { if (!live) return; setRes(r); setHits(r.hits); setLastBatch(r.hits.length); if (r.facets) setFacets(r.facets); })
       .catch((e) => live && setErr(String(e.message))).finally(() => live && setBusy(false));
     return () => { live = false; };
   }, [q, symbols, types, fyf, fyt]);
   const more = async () => {
+    const my = reqId.current;
     setBusy(true);
-    try { const r = await getJSON<Res>(`/api/library/search${qs({ q, symbols, types, fy_from: fyf, fy_to: fyt, limit: 15, offset: hits.length, facets: false })}`); setHits((h) => [...h, ...r.hits]); } catch (e) { setErr(String((e as Error).message)); } finally { setBusy(false); }
+    try {
+      const r = await getJSON<Res>(`/api/library/search${qs({ q, symbols, types, fy_from: fyf, fy_to: fyt, limit: 15, offset: hits.length, facets: false })}`);
+      if (my !== reqId.current) return; // the query changed meanwhile
+      setHits((h) => [...h, ...r.hits]); setLastBatch(r.hits.length);
+    } catch (e) { if (my === reqId.current) setErr(String((e as Error).message)); } finally { if (my === reqId.current) setBusy(false); }
   };
   const toggle = (cur: string, v: string) => { const s = new Set(cur ? cur.split(",") : []); s.has(v) ? s.delete(v) : s.add(v); return [...s].join(","); };
   const selS = symbols ? symbols.split(",") : [], selT = types ? types.split(",") : [];
@@ -80,7 +93,7 @@ function Inner() {
             <p className="mt-1 text-[13.5px] leading-relaxed"><Marked text={h.snippet} /></p>
           </article>
         ))}
-        {res && hits.length > 0 && hits.length % 15 === 0 && <button className="btn" onClick={more} disabled={busy}>{busy ? "Loading…" : "Load more"}</button>}
+        {res && lastBatch === 15 && (res.total_strict > hits.length || !hits[hits.length - 1].strict) && <button className="btn" onClick={more} disabled={busy}>{busy ? "Loading…" : "Load more"}</button>}
       </section>
     </div>
   );

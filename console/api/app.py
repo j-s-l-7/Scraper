@@ -522,6 +522,7 @@ def _meta(d: dict) -> dict:
 def document(key: str, page: int = Query(1, ge=1), limit: int = Query(3, ge=1, le=20)):
     d = _doc_or_404(key)
     meta = _meta(d)
+    meta["citation"] = lib_search.citation(d["symbol"], d["doc_type"], d["fiscal_year"], d["period_label"], page, page)
     p = _safe_path(d["text_path"])
     if not d["has_file"] or p is None:
         return {"meta": meta, "total_pages": d["page_count"], "page_from": page, "pages": [], "available": False}
@@ -535,7 +536,7 @@ def document_find(key: str, q: str = Query(..., min_length=1, max_length=200)):
     d = _doc_or_404(key)
     p = _safe_path(d["text_path"])
     if not d["has_file"] or p is None:
-        return {"q": q, "total": 0, "pages": []}
+        return {"q": q, "terms": query_terms(q), "total": 0, "pages": []}
     terms = [t for t in re.findall(r'"([^"]+)"|(\S+)', q) for t in t if t][:6]
     rx = re.compile("|".join(re.escape(t) for t in terms), re.I)
     hits, total = [], 0
@@ -546,7 +547,7 @@ def document_find(key: str, q: str = Query(..., min_length=1, max_length=200)):
             m = ms[0]
             s = max(0, m.start() - 70)
             hits.append({"page": pg["page"], "count": len(ms), "snippet": " ".join(pg["text"][s : m.end() + 90].split())})
-    return {"q": q, "total": total, "pages": hits[:300]}
+    return {"q": q, "terms": query_terms(q), "total": total, "pages": hits[:300]}
 
 
 # --------------------------------------------------------------------------- library
