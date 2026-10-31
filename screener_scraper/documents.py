@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import psycopg2
 import requests
 from psycopg2.extras import execute_values
 
@@ -29,7 +30,7 @@ from .rules import BLOCK_RE, DocNotFound, NoTextError
 log = logging.getLogger(__name__)
 
 DOCS_DIR = config.ROOT / "data" / "documents"
-DOC_TYPE_OF = {"docs_ar": "annual_report", "docs_concall": "concall_transcript"}
+DOC_TYPE_OF = {"docs_ar": "annual_report", "docs_concall": "concall_transcript", "docs_ppt": "concall_ppt"}
 MAX_BYTES = 250 * 1024 * 1024
 DOC_INTERVAL = 0.5           # min seconds between requests per worker process (BSE politeness)
 DOC_MAX_INTERVAL = 10.0
@@ -245,10 +246,55 @@ def extract_pages(pdf: bytes) -> Tuple[List[str], str]:
             if not pages:
                 raise Unreadable(f"{type(err).__name__}: {err}")
     if not any(p.strip() for p in pages):
-        e = NoTextError("no extractable text (scanned?)")
+        ocr = ocr_pages(pdf)
+        if ocr is not None and any(p.strip() for p in ocr):
+            return ocr, "tesseract"
+        e = NoTextError("no extractable text (scanned?)" + ("" if ocr is not None else "; OCR unavailable"))
         e.pages = len(pages)
         raise e
     return pages, extractor
+
+
+OCR_MAX_PAGES = 600
+OCR_DPI = 200
+
+
+def ocr_available() -> bool:
+    import os
+    import shutil
+    if os.environ.get("DOCS_NO_OCR"):
+        return False
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        return False
+    return shutil.which("tesseract") is not None
+
+
+def ocr_pages(pdf: bytes) -> Optional[List[str]]:
+    """OCR every page (PyMuPDF render at 200 dpi + tesseract eng), capped at 600 pages. None if tesseract is missing."""
+    if not ocr_available():
+        return None
+    import pytesseract
+    from PIL import Image
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    try:
+        n = doc.page_count
+        if n > OCR_MAX_PAGES:
+            log.warning("OCR: %d pages, only the first %d are read", n, OCR_MAX_PAGES)
+        out = []
+        for i in range(min(n, OCR_MAX_PAGES)):
+            pix = doc[i].get_pixmap(dpi=OCR_DPI)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            out.append(_clean(pytesseract.image_to_string(img, lang="eng")))
+        out += [""] * (n - len(out))
+        return out
+    finally:
+        doc.close()
 
 
 def write_text(symbol: str, doc_type: str, label: Optional[str], sha: str, pages: List[str]) -> Path:
@@ -289,23 +335,187 @@ def process_document(url: str, symbol: str, doc_type: str, label: Optional[str])
     """Download + extract + write one document. Returns {'status', ...fields}. Raises FetchError (transient/blocked)
     and DocNotFound (404); NoTextError / Unreadable are converted to statuses here."""
     t0 = time.monotonic()
-    raw = download(url)
-    pdf = unwrap(raw, url)
-    sha = hashlib.sha256(pdf).hexdigest()
-    base = {"sha": sha, "pdf_bytes": len(pdf), "download_s": round(time.monotonic() - t0, 2)}
+    return process_bytes(download(url), url, symbol, doc_type, label, t0)
+
+
+def process_bytes(raw: bytes, url: str, symbol: str, doc_type: str, label: Optional[str],
+                  t0: Optional[float] = None) -> dict:
+    """Sniff the format (PDF / HTML / DOCX / PPTX / TXT / ZIP of those), extract per-page text, write the file."""
+    t0 = t0 or time.monotonic()
+    try:
+        data, fmt = sniff_and_unwrap(raw, url)
+    except UnsupportedFormat as e:
+        return {"sha": hashlib.sha256(raw).hexdigest(), "pdf_bytes": len(raw), "status": "no_text",
+                "error": f"unsupported_format: {e}", "char_count": 0, "download_s": round(time.monotonic() - t0, 2)}
+    sha = hashlib.sha256(data).hexdigest()
+    base = {"sha": sha, "pdf_bytes": len(data), "download_s": round(time.monotonic() - t0, 2)}
     t1 = time.monotonic()
     try:
-        pages, extractor = extract_pages(pdf)
+        pages, extractor = extract_pages(data) if fmt == "pdf" else extract_other(data, fmt)
     except NoTextError as e:
         return {**base, "status": "no_text", "error": str(e), "page_count": getattr(e, "pages", None),
                 "char_count": 0, "extract_s": round(time.monotonic() - t1, 2)}
     except Unreadable as e:
-        return {**base, "status": "failed", "error": f"unreadable PDF: {e}"[:500],
+        return {**base, "status": "failed", "error": f"unreadable document: {e}"[:500],
                 "extract_s": round(time.monotonic() - t1, 2)}
     path = write_text(symbol, doc_type, label, sha, pages)
     return {**base, "status": "ok", "page_count": len(pages), "char_count": sum(len(p) for p in pages),
             "text_path": str(path.relative_to(config.ROOT)), "extractor": extractor,
             "extract_s": round(time.monotonic() - t1, 2)}
+
+
+class UnsupportedFormat(Exception):
+    pass
+
+
+def sniff_and_unwrap(raw: bytes, url: str, depth: int = 0) -> Tuple[bytes, str]:
+    """-> (bytes, fmt) with fmt in pdf|html|docx|pptx|txt. Looks at magic bytes, not the url or content-type."""
+    head = raw[:2048]
+    if b"%PDF" in head[:1024]:
+        return raw, "pdf"
+    if raw[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            names = z.namelist()
+            if "[Content_Types].xml" in names:
+                if any(n.startswith("word/") for n in names):
+                    return raw, "docx"
+                if any(n.startswith("ppt/") for n in names):
+                    return raw, "pptx"
+            if depth >= 1:
+                raise DocNotFound(f"nested zip: {url}")
+            order = {".pdf": 0, ".docx": 1, ".pptx": 2, ".htm": 3, ".html": 3, ".txt": 4}
+            members = sorted((n for n in names if n.lower().endswith(tuple(order))),
+                             key=lambda n: (order[next(e for e in order if n.lower().endswith(e))], n))
+            if not members:
+                other = [n for n in names if n.lower().endswith((".doc", ".ppt"))]
+                if other:
+                    raise UnsupportedFormat(f"legacy {other[0].rsplit('.', 1)[-1]} inside zip")
+                raise DocNotFound(f"zip has no supported document: {url}")
+            return sniff_and_unwrap(z.read(members[0]), url, depth + 1)
+    if raw[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":              # legacy OLE2: .doc / .ppt / .xls
+        converted = convert_legacy(raw)
+        if converted is None:
+            raise UnsupportedFormat("legacy .doc/.ppt and no libreoffice available")
+        return converted, "pdf"
+    text = head.decode("utf-8", "ignore")
+    low = text.lower()
+    if "<html" in low or "<!doctype html" in low or "<body" in low or "<head" in low:
+        if BLOCK_RE.search(raw[:6000].decode("utf-8", "ignore")) and len(raw) < 30000:
+            raise FetchError(f"blocked page (captcha/access denied): {url}", 403)
+        return raw, "html"
+    printable = sum(1 for ch in raw[:4000] if ch in (9, 10, 13) or 32 <= ch < 127 or ch >= 160)
+    if raw and printable / max(len(raw[:4000]), 1) > 0.95 and len(raw) > 500:
+        return raw, "txt"
+    raise DocNotFound(f"not a recognised document ({len(raw)} bytes): {url}")
+
+
+def convert_legacy(raw: bytes) -> Optional[bytes]:
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    exe = shutil.which("libreoffice") or shutil.which("soffice")
+    if not exe:
+        return None
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.bin")
+        open(src, "wb").write(raw)
+        try:
+            subprocess.run([exe, "--headless", "--convert-to", "pdf", "--outdir", d, src], capture_output=True, timeout=180)
+            out = os.path.join(d, "in.pdf")
+            return open(out, "rb").read() if os.path.exists(out) else None
+        except Exception:
+            return None
+
+
+def paginate(paras: List[str], size: int = 3000) -> List[str]:
+    """Pack paragraphs into ~size-char pseudo-pages (paragraph breaks kept; overlong paragraphs are split)."""
+    pages, cur = [], ""
+    for para in paras:
+        para = para.strip()
+        if not para:
+            continue
+        while len(para) > size:
+            cut = para.rfind(" ", 0, size)
+            cut = cut if cut > size // 2 else size
+            if cur:
+                pages.append(cur)
+                cur = ""
+            pages.append(para[:cut].strip())
+            para = para[cut:].strip()
+        if cur and len(cur) + len(para) + 2 > size:
+            pages.append(cur)
+            cur = para
+        else:
+            cur = f"{cur}\n\n{para}" if cur else para
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+def html_paragraphs(data: bytes) -> List[str]:
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(data, "lxml")
+    for t in soup(["script", "style", "noscript", "nav", "footer", "header", "aside", "form", "svg", "iframe"]):
+        t.decompose()
+    main = soup.find("main") or soup.find("article") or soup.find(id=re.compile("content|main", re.I)) or soup.body or soup
+    paras = []
+    for el in main.find_all(["p", "h1", "h2", "h3", "h4", "li", "blockquote", "td", "div"]):
+        if el.name == "div" and el.find(["p", "div", "li", "td"]):
+            continue                              # only leaf blocks
+        txt = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+        if txt:
+            paras.append(txt)
+    if not paras:
+        paras = [re.sub(r"\s+", " ", main.get_text(" ", strip=True))]
+    return paras
+
+
+def extract_other(data: bytes, fmt: str) -> Tuple[List[str], str]:
+    try:
+        if fmt == "html":
+            pages = paginate(html_paragraphs(data))
+            if sum(len(p) for p in pages) < 1500:            # soft-404 / stub pages are not transcripts
+                raise DocNotFound("html page with too little text")
+            return pages, "bs4-html"
+        if fmt == "docx":
+            import docx
+            d = docx.Document(io.BytesIO(data))
+            paras = [p.text for p in d.paragraphs]
+            for t in d.tables:
+                for row in t.rows:
+                    paras.append(" | ".join(c.text.strip() for c in row.cells))
+            pages = paginate(paras)
+            ex = "python-docx"
+        elif fmt == "pptx":
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(data))
+            pages = []
+            for sl in prs.slides:
+                parts = []
+                for sh in sl.shapes:
+                    if sh.has_text_frame:
+                        parts.append(sh.text_frame.text)
+                    if getattr(sh, "has_table", False) and sh.has_table:
+                        for row in sh.table.rows:
+                            parts.append(" | ".join(c.text for c in row.cells))
+                if sl.has_notes_slide:
+                    parts.append("Notes: " + sl.notes_slide.notes_text_frame.text)
+                pages.append(_clean("\n".join(x for x in parts if x.strip())))
+            ex = "python-pptx"
+        else:
+            txt = data.decode("utf-8", "ignore")
+            pages = paginate(re.split(r"\n\s*\n", txt))
+            ex = "plain-text"
+    except DocNotFound:
+        raise
+    except Exception as e:
+        raise Unreadable(f"{type(e).__name__}: {e}")
+    if not any(p.strip() for p in pages):
+        e = NoTextError("no text in document")
+        e.pages = len(pages)
+        raise e
+    return [_clean(p) for p in pages], ex
 
 
 _SRC_ORDER = {"bse": 0, "nse": 1}
@@ -443,8 +653,8 @@ def load_documents(db, limit: Optional[int] = None, batch_docs: int = 20) -> dic
     return {"documents": n_docs, "pages": n_pages}
 
 
-KIND_ALIASES = {"annual_report": "docs_ar", "concall_transcript": "docs_concall", "docs_ar": "docs_ar",
-                "docs_concall": "docs_concall"}
+KIND_ALIASES = {"annual_report": "docs_ar", "concall_transcript": "docs_concall", "concall_ppt": "docs_ppt",
+                "docs_ar": "docs_ar", "docs_concall": "docs_concall", "docs_ppt": "docs_ppt"}
 
 
 def _has_links(db, company_id: int, doc_type: str) -> bool:
@@ -455,7 +665,7 @@ def _has_links(db, company_id: int, doc_type: str) -> bool:
 
 
 def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool = False, limit: Optional[int] = None,
-                 universe: str = config.UNIVERSE_CODE, shard=None, slots: int = 1) -> int:
+                 universe: str = config.UNIVERSE_CODE, shard=None, slots: int = 1, retry_missing: bool = False, discover: bool = False) -> int:
     """`docs`: run the documents pipeline directly (no queue) for --symbols or a universe shard, with `slots`
     threads. Companies without document_link rows yet are skipped (a later run picks them up). Idempotent."""
     from concurrent.futures import ThreadPoolExecutor
@@ -493,10 +703,50 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
                 opened.append(d)
         return d
 
+    po = None
+    recovered: Dict[str, int] = {}
+    if retry_missing or discover:
+        from .fallback import Polite
+        po = Polite()
+
     def work(item):
         cid, sym = item
         d = tdb()
         for kind in kinds:
+            if discover:
+                if kind != "docs_concall":
+                    continue
+                from .fallback import discover_company
+                try:
+                    st = discover_company(d, cid, run_id, po)
+                except Exception as e:
+                    with lock:
+                        tot["failures"] += 1
+                    log.error("%s discover: %s: %s", sym, type(e).__name__, e)
+                    continue
+                with lock:
+                    tot["discovered"] = tot.get("discovered", 0) + st["discovered"]
+                    print(f"{sym} discover: expected={st['expected']} found={st['found']} missing={st['missing']} "
+                          f"discovered={st['discovered']}", flush=True)
+                continue
+            if retry_missing:
+                from .fallback import retry_company
+                try:
+                    st = retry_company(d, cid, run_id, kind, po)
+                except Exception as e:
+                    with lock:
+                        tot["doc_errors"] = tot.get("doc_errors", 0) + (not isinstance(e, psycopg2.Error))
+                        tot["failures"] += isinstance(e, psycopg2.Error)
+                    log.error("%s %s retry-missing: %s: %s", sym, kind, type(e).__name__, e)
+                    continue
+                with lock:
+                    for k, v in st["by_source"].items():
+                        recovered[k] = recovered.get(k, 0) + v
+                    tot["tried"] = tot.get("tried", 0) + st["tried"]
+                    tot["recovered"] = tot.get("recovered", 0) + st["recovered"]
+                    print(f"{sym} {kind}: retried={st['tried']} recovered={st['recovered']} {st['by_source']} "
+                          f"still_missing={st['still_missing']} {st['seconds']}s", flush=True)
+                continue
             if not _has_links(d, cid, DOC_TYPE_OF[kind]):
                 with lock:
                     tot["no_links"] += 1
@@ -506,7 +756,9 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
                 st = run_company(d, cid, run_id, kind, force=force, limit=limit)
             except Exception as e:
                 with lock:
-                    tot["failures"] += 1
+                    tot["doc_errors"] = tot.get("doc_errors", 0) + 1
+                    if isinstance(e, psycopg2.Error):
+                        tot["failures"] += 1
                 log.error("%s %s: %s: %s", sym, kind, type(e).__name__, e)
                 continue
             with lock:
@@ -531,10 +783,33 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
             print(f"== {kind}: {n} docs, avg {sum(x['seconds'] for x in docs) / n:.1f}s, "
                   f"avg pages {sum(x['pages'] or 0 for x in docs) / n:.0f}, "
                   f"avg chars {sum(x['chars'] or 0 for x in docs) / n:.0f}")
+    if retry_missing:
+        tot["by_source"] = recovered
+        print(f"== retry-missing: tried {tot.get('tried', 0)}, recovered {tot.get('recovered', 0)} by source {recovered}")
     db.finish_run(run_id, "partial" if tot["failures"] else "success", tot)
     print(f"== {len(companies)} companies, {tot['no_links']} kind-runs skipped for no links, "
           f"{tot['failures']} failures")
     return 1 if tot["failures"] else 0
+
+
+def docs_coverage(db, universe: str = config.UNIVERSE_CODE) -> None:
+    """Print equity.v_document_completeness for the universe."""
+    with db.trail.cursor() as cur:
+        cur.execute("""select v.nse_symbol, v.ar_found, v.ar_expected, v.ar_missing, v.cc_found, v.cc_expected,
+                              coalesce(array_length(v.cc_missing,1),0)
+                       from equity.v_document_completeness v
+                       where v.company_id in (select company_id from equity.universe where universe_code=%s and as_of=
+                             (select max(as_of) from equity.universe where universe_code=%s))
+                       order by v.nse_symbol""", (universe, universe))
+        rows = cur.fetchall()
+    print("symbol\tAR found/expected\tAR missing FYs\tcalls found/expected\tcalls missing")
+    tf = te = cf = ce = 0
+    for sym, af, ae, am, qf, qe, qm in rows:
+        print(f"{sym}\t{af}/{ae}\t{','.join(map(str, am)) or '-'}\t{qf}/{qe}\t{qm}")
+        tf, te, cf, ce = tf + af, te + ae, cf + qf, ce + qe
+    if rows:
+        print(f"-- {len(rows)} companies: annual reports {tf}/{te} ({100 * tf / max(te, 1):.1f}%), "
+              f"concall quarters {cf}/{ce} ({100 * cf / max(ce, 1):.1f}%)")
 
 
 def collect_documents(db, run_id: str, repo: Optional[str] = None, dest: Optional[Path] = None) -> dict:

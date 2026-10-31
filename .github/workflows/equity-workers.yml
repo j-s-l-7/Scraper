@@ -1,0 +1,81 @@
+name: equity-workers
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: "Number of parallel screener/yf runners (each has its own IP; the matrix supports up to 10)"
+        default: "5"
+      batch:
+        description: "Job batch to work on (e.g. 2026-11-01); empty = any open batch"
+        default: ""
+  schedule:
+    - cron: "30 20 * * 6"   # Sunday 02:00 IST
+
+concurrency:
+  group: equity-workers
+  cancel-in-progress: false
+
+jobs:
+  enqueue:
+    # Scheduled path only: create today's batch. Manual dispatches expect the batch to exist already.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      batch: ${{ steps.b.outputs.batch }}
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - id: b
+        run: echo "batch=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - run: python -m screener_scraper enqueue --batch "${{ steps.b.outputs.batch }}"
+
+  plan:
+    needs: [enqueue]
+    if: ${{ !cancelled() && (needs.enqueue.result == 'success' || needs.enqueue.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      batch: ${{ steps.m.outputs.batch }}
+    steps:
+      - id: m
+        run: |
+          n="${{ github.event.inputs.runners || '5' }}"
+          [ "$n" -gt 10 ] && n=10
+          echo "matrix=$(python3 -c "import json;print(json.dumps({'runner':list(range(1,$n+1))}))")" >> "$GITHUB_OUTPUT"
+          echo "batch=${{ needs.enqueue.outputs.batch || github.event.inputs.batch }}" >> "$GITHUB_OUTPUT"
+
+  work:
+    needs: [plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      BATCH: ${{ needs.plan.outputs.batch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Worker ${{ matrix.runner }}
+        run: |
+          python -m screener_scraper worker --kinds screener,yf --class gh --slots 1 --max-runtime 110 \
+            ${BATCH:+--batch "$BATCH"}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-worker-${{ matrix.runner }}
+          path: logs/
+          if-no-files-found: ignore

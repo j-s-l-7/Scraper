@@ -31,3 +31,16 @@ Thumbs.db
 
 # Supabase CLI scratch
 supabase/.temp/
+
+# Local indexes, state and build output (never commit)
+data/*.sqlite
+data/*.sqlite-*
+data/.collected_runs
+data/.refresh.lock
+data/.no-autosync
+data/lake/
+reports/
+console/web/node_modules/
+console/web/.next/
+console/web/out/
+*.tsbuildinfo

@@ -44,8 +44,7 @@ if [ -n "$(git status --porcelain)" ]; then
     if git diff --cached | grep -qE 'sk-proj|sk-[A-Za-z0-9]{20,}|postgres(ql)?://[^:@ ]+:[^@ ]+@|eyJhbGci|sb_secret_'; then
       echo "secret-like string staged; autosync aborted"; git reset -q; exit 0
     fi
-    AUTHOR_NAME=$(git log -1 --format=%an 182ce77); AUTHOR_EMAIL=$(git log -1 --format=%ae 182ce77)
-    git -c user.name="$AUTHOR_NAME" -c user.email="$AUTHOR_EMAIL" commit -q -m "chore(autosync): $(git diff --cached --name-only | wc -l | tr -d ' ') files, tests green
+    git commit -q -m "chore(autosync): $(git diff --cached --name-only | wc -l | tr -d ' ') files, tests green
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" \
       && git pull -q --rebase origin main && git push -q origin main && echo "pushed $(git log --oneline -1)"

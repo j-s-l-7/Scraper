@@ -21,16 +21,19 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}    # optional: audio transcription is skipped when empty
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+      - name: OCR + audio tools
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr ffmpeg
       - run: pip install -r requirements.txt
       - name: Documents shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }}
         run: |
-          python -m screener_scraper docs --universe TOP100_MCAP --shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }} --slots 4
+          python -m screener_scraper docs --universe TOP100_MCAP --shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }} --slots 4 --kinds annual_report,concall_transcript,concall_ppt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

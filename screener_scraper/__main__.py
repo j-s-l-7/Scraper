@@ -86,7 +86,7 @@ def main(argv=None) -> int:
     en = sub.add_parser("enqueue", help="create jobs (one per kind per company) for a batch")
     en.add_argument("--batch", required=True, help="e.g. 2026-11-01")
     en.add_argument("--universe", default=config.UNIVERSE_CODE)
-    en.add_argument("--kinds", default="screener,yf,docs_ar,docs_concall")
+    en.add_argument("--kinds", default="screener,yf,docs_ar,docs_concall,docs_ppt")
     en.add_argument("--symbols", help="restrict to these symbols (testing)")
     wk = sub.add_parser("worker", help="claim and run queue jobs")
     wk.add_argument("--kinds", required=True, help="comma list of screener,yf,docs_ar,docs_concall")
@@ -104,11 +104,16 @@ def main(argv=None) -> int:
     dc.add_argument("--symbols", help="comma separated symbols (default: the whole universe)")
     dc.add_argument("--universe", default=config.UNIVERSE_CODE)
     dc.add_argument("--shard", help="k/n slice of the universe by rank")
-    dc.add_argument("--kinds", default="annual_report,concall_transcript",
-                    help="annual_report,concall_transcript (aliases docs_ar,docs_concall)")
+    dc.add_argument("--kinds", default="annual_report,concall_transcript,concall_ppt",
+                    help="annual_report,concall_transcript,concall_ppt (aliases docs_ar,docs_concall,docs_ppt)")
     dc.add_argument("--slots", type=int, default=1, help="parallel companies (threads)")
     dc.add_argument("--force", action="store_true", help="also retry no_text / missing documents")
     dc.add_argument("--limit", type=int, help="max documents per kind per company (testing)")
+    dc.add_argument("--retry-missing", action="store_true",
+                    help="only missing/failed documents, through the wayback -> company-site fallback chain")
+    dc.add_argument("--discover", action="store_true",
+                    help="concall transcripts only: find quarters with no transcript on the company site")
+    sub.add_parser("docs-coverage", help="print equity.v_document_completeness (annual reports + concall quarters)")
     cd = sub.add_parser("collect-documents", help="merge documents-shard-* artifacts of a workflow run into data/documents")
     cd.add_argument("run_id")
     cd.add_argument("--repo", help="default env GH_REPO or j-s-l-7/Scraper")
@@ -174,7 +179,10 @@ def main(argv=None) -> int:
             from .documents import run_docs_cli
             syms = [x.strip() for x in a.symbols.split(",") if x.strip()] if a.symbols else None
             return run_docs_cli(db, syms, [k.strip() for k in a.kinds.split(",") if k.strip()], a.force, a.limit,
-                                a.universe, config.parse_shard(a.shard), a.slots)
+                                a.universe, config.parse_shard(a.shard), a.slots, a.retry_missing, a.discover)
+        elif a.cmd == "docs-coverage":
+            from .documents import docs_coverage
+            docs_coverage(db)
         elif a.cmd == "collect-documents":
             from .documents import collect_documents
             r = collect_documents(db, a.run_id, a.repo)
