@@ -521,7 +521,8 @@ def extract_other(data: bytes, fmt: str) -> Tuple[List[str], str]:
 _SRC_ORDER = {"bse": 0, "nse": 1}
 
 
-def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False, limit: Optional[int] = None) -> dict:
+def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False, limit: Optional[int] = None,
+                hosts: Optional[set] = None) -> dict:
     """Process every document_link of the kind's doc_type for one company. Idempotent: documents already ok
     (and, unless force, no_text / missing) are skipped. Raises the first transient FetchError AFTER processing
     everything else so the rule engine can retry the job (finished documents are skipped next time)."""
@@ -553,6 +554,16 @@ def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False
         if done:
             stats["skipped"] += 1
             continue
+        if hosts is not None:
+            # host routing: one polite process per host never overlaps another. A process only attempts members on
+            # its own hosts, and the non-BSE processes wait until the BSE member has been tried (BSE goes first).
+            if "bse" not in hosts and any(m[2] == "bse" and have.get(m[0]) is None for m in members):
+                stats["skipped"] += 1
+                continue
+            members = [m for m in members if m[2] in hosts]
+            if not members:
+                stats["skipped"] += 1
+                continue
         if limit is not None and stats["groups_done"] >= limit:
             break
         stats["groups_done"] += 1
@@ -665,7 +676,7 @@ def _has_links(db, company_id: int, doc_type: str) -> bool:
 
 
 def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool = False, limit: Optional[int] = None,
-                 universe: str = config.UNIVERSE_CODE, shard=None, slots: int = 1, retry_missing: bool = False, discover: bool = False) -> int:
+                 universe: str = config.UNIVERSE_CODE, shard=None, slots: int = 1, retry_missing: bool = False, discover: bool = False, hosts: Optional[set] = None) -> int:
     """`docs`: run the documents pipeline directly (no queue) for --symbols or a universe shard, with `slots`
     threads. Companies without document_link rows yet are skipped (a later run picks them up). Idempotent."""
     from concurrent.futures import ThreadPoolExecutor
@@ -753,7 +764,7 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
                 log.info("%s %s: no document_link rows yet, skipped", sym, kind)
                 continue
             try:
-                st = run_company(d, cid, run_id, kind, force=force, limit=limit)
+                st = run_company(d, cid, run_id, kind, force=force, limit=limit, hosts=hosts)
             except Exception as e:
                 with lock:
                     tot["doc_errors"] = tot.get("doc_errors", 0) + 1

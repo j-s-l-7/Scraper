@@ -57,6 +57,14 @@ class Helpers(unittest.TestCase):
         assert parse_candidates(nifty)[0][0] == "XXX"
 
 
+class FleetRouting(unittest.TestCase):
+    def test_select_for(self):
+        from screener_scraper.fleet import select_for
+        ranked = [(101, 1, "A"), (102, 2, "B"), (103, 3, "C")]
+        assert [r[0] for r in select_for("screener", ranked, 0, 1)] == [103, 102, 101]     # descending
+        assert [r[0] for r in select_for("bse", ranked, 0, 1)] == [101, 102, 103]
+
+
 def _lake_up():
     try:
         import psycopg2
@@ -147,6 +155,39 @@ class SyntheticLoad(unittest.TestCase):
             d.execute("select extra from equity.market_snapshot"); assert d.fetchone()[0] == {"a": 1}
             d.execute("select count(*) from equity.historical_prices"); assert d.fetchone()[0] == 1
         assert totals1["financial_fact"] == totals2["financial_fact"] == 2
+
+    def test_merge_with_direct_local_writes(self):
+        """The lake already holds the same company / metrics / holder written directly by a local fleet process
+        (different surrogate ids). Loading a GitHub export must merge by natural key, not duplicate."""
+        src, dst = self.conns["lake_t_src"], self.conns["lake_t_dst"]
+        with dst.cursor() as d:
+            d.execute("truncate equity.financial_fact, equity.shareholding_holder, equity.scrape_task, "
+                      "equity.market_snapshot, equity.historical_prices, equity.company, equity.metric, "
+                      "equity.holder, equity.scrape_run cascade")
+            d.execute("insert into equity.metric(section,name,unit) values ('cash-flow','Zzz','cr')")   # shifts ids
+            d.execute("insert into equity.metric(section,name,unit) values ('profit-loss','Sales','cr') returning metric_id")
+            sid = d.fetchone()[0]
+            d.execute("insert into equity.holder(holder_key,name) values ('other','O'),('/people/1/x/','X')")
+            d.execute("insert into equity.company(company_id,screener_slug,name,nse_symbol) values (1,'AAA','Aaa','AAA')")
+            d.execute("insert into equity.financial_fact(company_id,basis,metric_id,period_type,period_end,value) "
+                      "values (1,'C',%s,'A','2025-03-31',90)", (sid,))
+        with src.cursor() as c:
+            c.execute("truncate equity.financial_fact, equity.shareholding_holder, equity.scrape_task, "
+                      "equity.market_snapshot, equity.historical_prices, equity.company, equity.metric, "
+                      "equity.holder, equity.scrape_run cascade")
+            c.execute("insert into equity.company(company_id,screener_slug,name,nse_symbol) values (1,'AAA','Aaa','AAA')")
+            c.execute("insert into equity.metric(section,name,unit) values ('profit-loss','Sales','cr') returning metric_id")
+            m = c.fetchone()[0]
+            c.execute("insert into equity.financial_fact(company_id,basis,metric_id,period_type,period_end,value) "
+                      "values (1,'C',%s,'A','2026-03-31',100),(1,'C',%s,'A','2025-03-31',91)", (m, m))
+        with tempfile.TemporaryDirectory() as tmp:
+            lake.export_tables(src, Path(tmp) / "e", 1, company_id=1, symbol="AAA")
+            lake.load_export_dir(dst, Path(tmp) / "e")
+        with dst.cursor() as d:
+            d.execute("select count(*) from equity.metric where name='Sales'"); assert d.fetchone()[0] == 1
+            d.execute("select period_end::text, value from equity.financial_fact order by 1")
+            assert d.fetchall() == [("2025-03-31", 91), ("2026-03-31", 100)]       # 2025 updated, no duplicate
+            d.execute("select count(*) from equity.company"); assert d.fetchone()[0] == 1
 
 
 if __name__ == "__main__":

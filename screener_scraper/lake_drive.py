@@ -24,6 +24,8 @@ from .rank import TOP1000_CODE
 
 log = logging.getLogger(__name__)
 
+import os as _os
+_os.environ.setdefault("SUPABASE_TXN_POOL", "1")      # parallel runners + console exhaust the session pooler (15)
 REPO = "j-s-l-7/Scraper"
 WINDOWS = [(101, 400), (401, 700), (701, 1000)]
 RUNNERS = 20
