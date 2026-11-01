@@ -12,7 +12,7 @@ import sqlite3
 import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -619,7 +619,82 @@ def ops():
     return {**out, "library": library_stats()}
 
 
-OPS_TTL = 900.0  # refreshed by the warm loop every ~5 min; the completeness view is slow on Supabase
+OPS_TTL = 900.0  # refreshed by the warm loop every ~5 min
+FLEET = ["screener", "yf", "bse", "nse", "concalls", "sources"]
+BANDS = [(1, 100), (101, 400), (401, 700), (701, 1000)]
+
+_COVERAGE_SQL = """
+with u as (
+    select company_id, rank from equity.universe
+    where universe_code = 'TOP1000_MCAP' and as_of = (select max(as_of) from equity.universe where universe_code = 'TOP1000_MCAP')
+)
+select case when rank <= 100 then 1 when rank <= 400 then 101 when rank <= 700 then 401 else 701 end as band,
+       count(*) as total,
+       count(*) filter (where exists (select 1 from equity.financial_fact f join equity.metric m using (metric_id)
+                                      where f.company_id = u.company_id and m.source = 'screener' and m.section = 'profit-loss')) as screener,
+       count(*) filter (where exists (select 1 from equity.financial_fact f join equity.metric m using (metric_id)
+                                      where f.company_id = u.company_id and m.source <> 'screener')) as yf,
+       count(*) filter (where exists (select 1 from equity.document d where d.company_id = u.company_id
+                                      and d.doc_type = 'annual_report' and d.status = 'ok')) as ar,
+       count(*) filter (where exists (select 1 from equity.document d where d.company_id = u.company_id
+                                      and d.doc_type = 'concall_transcript' and d.status = 'ok')) as cc
+from u group by 1 order by 1
+"""
+
+
+def _tail(path: Path, n: int = 400) -> str:
+    """Last non-empty line of a log file (reads only its last few KB)."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 16384))
+            lines = [l for l in f.read().decode("utf-8", "replace").splitlines() if l.strip()]
+        logged = [l for l in lines if re.match(r"\d\d:\d\d:\d\d ", l)]   # skip library warnings / tracebacks
+        return (logged or lines)[-1].strip()[:n] if lines else ""
+    except OSError:
+        return ""
+
+
+def _fleet() -> list[dict]:
+    import os
+    out = []
+    for name in FLEET:
+        alive = False
+        try:
+            os.kill(int((ROOT / "data" / "fleet" / f"{name}.pid").read_text().strip()), 0)
+            alive = True
+        except (OSError, ValueError):
+            pass
+        log = ROOT / "logs" / f"fleet_{name}.log"
+        mtime = log.stat().st_mtime if log.exists() else None
+        out.append({"name": name, "alive": alive, "last": _tail(log),
+                    "last_at": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None})
+    return out
+
+
+def _load_rollout() -> dict:
+    """Top-1000 coverage by rank band and GitHub wave loading, both from the local lake."""
+    cov = {r["band"]: r for r in db.query(_COVERAGE_SQL, target="lake")}
+    bands = [{"from": a, "to": b, **{k: cov.get(a, {}).get(k, 0) for k in ("total", "screener", "yf", "ar", "cc")}}
+             for a, b in BANDS]
+    runs = db.query(
+        """select run_id,
+                  count(*) filter (where status = 'loaded' and artifact like 'lake-%%') as parts_loaded,
+                  coalesce(sum(rows_loaded) filter (where artifact like 'lake-%%'), 0) as rows_loaded,
+                  bool_or(artifact = '__complete__') as complete,
+                  max(loaded_at) as last_at
+           from public.lake_load_log group by run_id
+           having count(*) filter (where status = 'loaded' and artifact like 'lake-%%') > 0
+           order by max(loaded_at) desc limit 6""", target="lake")
+    return {"bands": bands, "runs": runs, "as_of": datetime.now().isoformat(timespec="seconds")}
+
+
+@app.get("/api/rollout")
+def rollout():
+    out = db.cached("rollout", _load_rollout, ttl=120.0)
+    logs = sorted((ROOT / "logs").glob("lake_drive_*.log"))
+    loader = {"running": (ROOT / "data" / ".lake-drive.lock").exists(), "last": _tail(logs[-1]) if logs else ""}
+    return {**out, "fleet": _fleet(), "loader": loader}
 _ops_lock = threading.Lock()
 
 
@@ -678,6 +753,11 @@ def _warm_loop() -> None:
                     db.put("ops", _load_ops())
             except Exception as e:
                 db.log.warning("warm loop (ops): %s", e)
+        if n % 2 == 0:
+            try:
+                db.put("rollout", _load_rollout())
+            except Exception as e:
+                db.log.warning("warm loop (rollout): %s", e)
         n += 1
         time.sleep(45)
 
