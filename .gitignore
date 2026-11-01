@@ -48,3 +48,4 @@ console/web/out/
 # Conversation exports and local agent state (never publish)
 /*.txt
 data/.*
+!/requirements.txt
