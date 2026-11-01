@@ -44,3 +44,7 @@ console/web/node_modules/
 console/web/.next/
 console/web/out/
 *.tsbuildinfo
+
+# Conversation exports and local agent state (never publish)
+/*.txt
+data/.*
