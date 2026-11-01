@@ -98,6 +98,16 @@ def lake_up() -> str:
     """Idempotent: init the cluster, start it if down, create the database, apply every migration."""
     LAKE_DIR.mkdir(parents=True, exist_ok=True)
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    bin_major = _run(pg_bin("pg_ctl"), "--version").stdout.split()[-1].split(".")[0]
+    if (PGDATA / "PG_VERSION").exists() and (PGDATA / "PG_VERSION").read_text().strip() != bin_major:
+        if lake_running():
+            _run(pg_bin("pg_ctl"), "-D", str(PGDATA), "stop", "-m", "fast", check=False)
+        backup = PGDATA.with_name(f"pgdata.v{(PGDATA / 'PG_VERSION').read_text().strip()}.{int(time.time())}")
+        log.warning("pgdata is PG %s but binaries are PG %s: moving it to %s and re-initialising",
+                    (PGDATA / "PG_VERSION").read_text().strip(), bin_major, backup.name)
+        PGDATA.rename(backup)
+    if (PGDATA / "postmaster.pid").exists() and not lake_running():
+        (PGDATA / "postmaster.pid").unlink()                  # stale pid file after a crash / reboot
     if not (PGDATA / "PG_VERSION").exists():
         log.info("initdb %s", PGDATA)
         _run(pg_bin("initdb"), "-D", str(PGDATA), "-A", "trust", "-U", getpass.getuser(), "-E", "UTF8")
@@ -123,9 +133,17 @@ def lake_up() -> str:
     conn = psycopg2.connect(url, connect_timeout=10)
     conn.autocommit = True
     with conn.cursor() as cur:
-        for f in sorted(config.SQL_DIR.glob("*.sql")):
-            cur.execute(f.read_text())
         cur.execute((config.SQL_DIR / "lake" / "lake_tables.sql").read_text())
+        cur.execute("create table if not exists public.lake_migration(name text primary key, "
+                    "applied_at timestamptz not null default now())")
+        cur.execute("select name from public.lake_migration")
+        applied = {r[0] for r in cur.fetchall()}
+        # sql files redefine views across migrations, so each file must run exactly once, in order
+        for f in sorted(config.SQL_DIR.glob("*.sql")):
+            if f.name in applied:
+                continue
+            cur.execute(f.read_text())
+            cur.execute("insert into public.lake_migration(name) values (%s)", (f.name,))
     conn.close()
     return url
 
