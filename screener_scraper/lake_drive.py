@@ -152,6 +152,15 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
                             "files=excluded.files, rows_loaded=excluded.rows_loaded, status='loaded', loaded_at=now()",
                             (run_id, art.name, n_files, sum(rows.values())))
         shutil.rmtree(dest, ignore_errors=True)
+        try:        # a run counts as fully loaded only once it has completed AND every artifact was loaded
+            st = gh("run", "view", str(run_id), "-R", repo(), "--json", "status", "--jq", ".status").strip()
+        except Exception:
+            st = ""
+        if st == "completed":
+            with conn, conn.cursor() as cur:
+                cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
+                            "values (%s,'__complete__',%s,%s,'loaded') on conflict (run_id, artifact) do update "
+                            "set loaded_at=now()", (run_id, len(arts), sum(totals.values())))
         return totals
     finally:
         if own:
@@ -192,7 +201,7 @@ def drive_once(allow_dispatch: bool = True) -> str:
         busy = [r for r in runs if r["status"] in BUSY]
         # 3. load completed runs
         with conn.cursor() as cur:
-            cur.execute("select distinct run_id from public.lake_load_log where status='loaded'")
+            cur.execute("select distinct run_id from public.lake_load_log where artifact='__complete__'")
             loaded = {r[0] for r in cur.fetchall()}
         conn.rollback()
         for r in sorted(runs, key=lambda x: x["databaseId"]):
