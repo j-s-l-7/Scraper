@@ -111,6 +111,8 @@ def main(argv=None) -> int:
     dc.add_argument("--limit", type=int, help="max documents per kind per company (testing)")
     dc.add_argument("--retry-missing", action="store_true",
                     help="only missing/failed documents, through the wayback -> company-site fallback chain")
+    dc.add_argument("--hosts", help="comma list of bse,nse,other: only attempt document URLs on these hosts "
+                                    "(one process per host); non-BSE hosts wait for the BSE attempt first")
     dc.add_argument("--discover", action="store_true",
                     help="concall transcripts only: find quarters with no transcript on the company site")
     sub.add_parser("docs-coverage", help="print equity.v_document_completeness (annual reports + concall quarters)")
@@ -119,6 +121,11 @@ def main(argv=None) -> int:
     cd.add_argument("--repo", help="default env GH_REPO or j-s-l-7/Scraper")
     ld = sub.add_parser("load-documents", help="bulk-load local jsonl.gz into equity.document_page (needs a bigger DB)")
     ld.add_argument("--limit", type=int)
+    so = sub.add_parser("sources", help="public sources -> local lake (nse_bhav_full,bse_bhav,bulk_block,fo_bhav,"
+                                         "credit_ratings,macro,gdelt_news)")
+    so.add_argument("--only", help="comma separated source names (default: all)")
+    so.add_argument("--backfill-from", help="YYYY-MM-DD: per-day backfill from this date (skips days already loaded)")
+    so.add_argument("--daily", action="store_true", help="only sources not yet run today (control-row marker); for refresh.sh")
     sub.add_parser("lake-up", help="start the local Postgres lake (port 5433) if down; init + migrate; idempotent")
     ll = sub.add_parser("lake-load", help="download lake-<run_id>-* artifacts of an equity-lake run and load them")
     ll.add_argument("run_id", type=int)
@@ -132,6 +139,11 @@ def main(argv=None) -> int:
     lr.add_argument("--ranks", help="explicit comma list of ranks (retry windows)")
     lr.add_argument("--out", default="lake-out")
     lr.add_argument("--max-minutes", type=float, default=310)
+    fw = sub.add_parser("fleet-worker", help="local fleet process writing directly to the lake (see scripts/local-fleet.sh)")
+    fw.add_argument("--role", required=True, choices=["screener", "yf", "bse", "nse", "concalls"])
+    fw.add_argument("--index", type=int, default=0)
+    fw.add_argument("--of", type=int, default=1)
+    fw.add_argument("--once", action="store_true")
     rc = sub.add_parser("rank-candidates", help="(GitHub runner) market cap of a slice of NSE EQUITY_L -> universe_candidate")
     rc.add_argument("--shard", required=True, help="k/n")
     rc.add_argument("--limit", type=int)
@@ -153,10 +165,29 @@ def main(argv=None) -> int:
         from .lake import lake_up
         print(lake_up())
         return 0
+    if a.cmd == "sources":
+        from .db import DB
+        from .lake import lake_url
+        from .sources import run_sources, single_instance
+        only = [x.strip() for x in a.only.split(",") if x.strip()] if a.only else None
+        with single_instance("sources" + ("_daily" if a.daily else "_" + (a.only or "all").replace(",", "_"))) as ok:
+            if not ok:
+                print("another sources run holds the lock; exiting")
+                return 0
+            sdb = DB(lake_url())
+            try:
+                res = run_sources(sdb, only, date.fromisoformat(a.backfill_from) if a.backfill_from else None, a.daily)
+            finally:
+                sdb.close()
+        print(res)
+        return 1 if any(r.get("status") == "failed" for r in res.values()) else 0
     if a.cmd == "lake-load":
         from .lake_drive import load_run
         print(load_run(a.run_id))
         return 0
+    if a.cmd == "fleet-worker":
+        from .fleet import run_fleet_worker
+        return run_fleet_worker(a.role, a.index, a.of, a.once)
     if a.cmd == "lake-start":
         from .lake_drive import lake_start
         return lake_start()
@@ -216,7 +247,8 @@ def main(argv=None) -> int:
             from .documents import run_docs_cli
             syms = [x.strip() for x in a.symbols.split(",") if x.strip()] if a.symbols else None
             return run_docs_cli(db, syms, [k.strip() for k in a.kinds.split(",") if k.strip()], a.force, a.limit,
-                                a.universe, config.parse_shard(a.shard), a.slots, a.retry_missing, a.discover)
+                                a.universe, config.parse_shard(a.shard), a.slots, a.retry_missing, a.discover,
+                                set(x.strip() for x in a.hosts.split(",")) if a.hosts else None)
         elif a.cmd == "docs-coverage":
             from .documents import docs_coverage
             docs_coverage(db)

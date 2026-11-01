@@ -34,8 +34,17 @@ done
 #     daily top-100 sync + equity-docs, weekly equity-shards. Idempotent; never fails; logs one summary line.
 "$PY" -m screener_scraper lake-drive 2>&1 | tail -n 3 || true
 
+# 1b2. local fleet: restart any dead worker process (idempotent; only starts the ones not running)
+scripts/local-fleet.sh start 2>&1 | tail -n 3 || true
+
 # 1c. data-quality engine: checks + bounded auto-remediation + scorecard; once per day per DB (marker in equity.control)
 "$PY" -m screener_scraper dq --db both 2>&1 | tail -n 2 | cut -c1-400 || true
+
+# 1c. public sources -> local lake (bhavcopies, F&O, bulk/block, credit ratings, macro, GDELT). Detached so a long
+#     source never holds the refresh lock; gated per source by an equity.control marker (one success per IST day).
+if lsof -iTCP:5433 -sTCP:LISTEN >/dev/null 2>&1; then
+  LC_ALL=en_US.UTF-8 nohup "$PY" -m screener_scraper sources --daily >> "logs/sources_daily_$(date +%F).log" 2>&1 &
+fi
 
 # 2. library index (incremental; skips docs whose file isn't local yet)
 [ -d library ] && "$PY" -m library.index || echo "library index skipped/failed"

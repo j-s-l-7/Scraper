@@ -15,6 +15,12 @@ schema that belongs to another app. **Never read, write, or join to `mf` from he
 | NSE corporate actions | fallback when yfinance has none | `yf.py` |
 | BSE / NSE filings | annual report + concall transcript full text (per page) | `screener_scraper/documents.py` (`docs`), `ingestion/ingest_concalls.py` (legacy) |
 
+### Public sources (local lake only, `screener_scraper/sources/`, migrations `sql/090-097`)
+`python -m screener_scraper sources --only X [--backfill-from YYYY-MM-DD]` (X: nse_bhav_full, bse_bhav, bulk_block,
+fo_bhav, credit_ratings, macro, gdelt_news); `refresh.sh` runs `sources --daily`, gated by `equity.control` key
+`source:<name>`. Plain static/official GETs only, >=1s per host, a 401/403/429 or bot-check is final for the run
+(`blocked_on` marker). Coverage: `equity.v_source_coverage`.
+
 Full design: **ARCHITECTURE.md**. Project skills in `.claude/skills/`: `scrape-screener` (operations and
 triage), `equity-db` (querying and storing conventions), `ingest-prices`, `ingest-concalls`.
 
