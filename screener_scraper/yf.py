@@ -1,5 +1,5 @@
 """yfinance layer (ARCHITECTURE.md section 7): statements, daily prices, actions, shares, snapshot, estimates,
-earnings, insiders, plus NSE corporate-actions fallback. Parsers are pure (DataFrame -> tuples) and unit-tested;
+earnings, insiders, (the NSE corporate-actions fallback was removed). Parsers are pure (DataFrame -> tuples) and unit-tested;
 network calls are thin wrappers with >=1s spacing and backoff on rate limits."""
 from __future__ import annotations
 
@@ -245,47 +245,6 @@ def insider_rows(df, company_id: int) -> List[tuple]:
     return list(out.values())
 
 
-# ───────────────────────────── NSE corporate actions ─────────────────────────────
-_RS = r"(?:Rs\.?|Re\.?|INR|₹)\s*"
-
-
-def parse_nse_subject(subject: str) -> Optional[Tuple[str, Optional[float]]]:
-    """NSE `subject` text -> (action_type, value) or None.
-    dividend: rupees per share; split: new shares per old (Rs10 -> Rs2 = 5.0); bonus a:b -> (a+b)/b."""
-    s = " ".join((subject or "").split())
-    low = s.lower()
-    if "dividend" in low:
-        nums = [float(x) for x in re.findall(_RS.replace("\\s*", "") + r"\s*([\d]+(?:\.\d+)?)", s, flags=re.I)]
-        if not nums:
-            nums = [float(x) for x in re.findall(r"([\d]+(?:\.\d+)?)\s*(?:per share|/-)", s, flags=re.I)]
-        return ("dividend", nums[0] if nums else None)
-    if "bonus" in low:
-        m = re.search(r"(\d+)\s*:\s*(\d+)", s)
-        return ("bonus", (int(m.group(1)) + int(m.group(2))) / int(m.group(2)) if m else None)
-    if "split" in low or "sub-division" in low or "subdivision" in low:
-        m = re.search(r"from\s*" + _RS + r"([\d.]+).*?to\s*" + _RS + r"([\d.]+)", s, flags=re.I)
-        return ("split", float(m.group(1)) / float(m.group(2)) if m and float(m.group(2)) else None)
-    if "rights" in low:
-        return ("rights", None)
-    return None
-
-
-def nse_action_rows(records: List[dict], company_id: int) -> List[tuple]:
-    out = {}
-    for rec in records or []:
-        parsed = parse_nse_subject(rec.get("subject", ""))
-        ex = rec.get("exDate")
-        if not parsed or not ex or ex == "-":
-            continue
-        try:
-            d = datetime.strptime(ex.strip(), "%d-%b-%Y").date()
-        except ValueError:
-            continue
-        atype, val = parsed
-        out[(atype, d)] = (company_id, atype, d, val, rec.get("subject"), "nse")
-    return list(out.values())
-
-
 # ───────────────────────────── network wrappers ─────────────────────────────
 _yf_lock = threading.Lock()
 _yf_last = [0.0]
@@ -318,25 +277,8 @@ def with_retry(fn: Callable, what: str, attempts: int = 4):
             time.sleep(delay)
 
 
-def nse_fetch_actions(symbol: str) -> List[dict]:
-    import requests
-    s = requests.Session()
-    s.headers.update({"User-Agent": config.USER_AGENT, "Accept": "application/json, text/plain, */*",
-                      "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.nseindia.com/"})
-    s.get("https://www.nseindia.com", timeout=30)         # warm up cookies
-    time.sleep(1)
-    r = s.get("https://www.nseindia.com/api/corporates-corporateActions",
-              params={"index": "equities", "symbol": symbol}, timeout=30)
-    if r.status_code >= 400:
-        from .http import HTTPFailure
-        raise HTTPFailure(f"NSE corporate actions {symbol}: HTTP {r.status_code}", r.status_code)
-    data = r.json()
-    return data if isinstance(data, list) else data.get("data", [])
-
-
-# ───────────────────────────── per-company driver ─────────────────────────────
 def _dataset(tasks: List[TaskResult], name: str, fn: Callable[[TaskResult], int]) -> None:
-    t = TaskResult(name, fatal=name != "yf:nse_actions")     # the NSE fallback is best-effort
+    t = TaskResult(name, fatal=True)
     tasks.append(t)
     try:
         t.rows = fn(t)
@@ -350,7 +292,7 @@ def _dataset(tasks: List[TaskResult], name: str, fn: Callable[[TaskResult], int]
 
 
 def process_company_yf(db: DB, run_id: int, company_id: int, nse_symbol: Optional[str], bse_code: Optional[str],
-                       as_of: Optional[date] = None, nse_fallback: bool = True) -> List[TaskResult]:
+                       as_of: Optional[date] = None, nse_fallback: bool = False) -> List[TaskResult]:
     """Run every yfinance dataset for one company (each in its own transaction + scrape_task). Never raises;
     returns the TaskResults (`.exc`, `.fatal`)."""
     import yfinance
@@ -444,18 +386,9 @@ def process_company_yf(db: DB, run_id: int, company_id: int, nse_symbol: Optiona
                      ("yf:earnings", earnings), ("yf:insiders", insiders)):
         _dataset(tasks, name, fn)
 
-    if nse_fallback and nse_symbol:
-        with db.trail.cursor() as cur:
-            cur.execute("select count(*) from equity.corporate_action where company_id=%s and source='yfinance'",
-                        (company_id,))
-            has_yf = cur.fetchone()[0] > 0
-
-        def nse(task):
-            recs = nse_fetch_actions(nse_symbol)
-            rows = nse_action_rows(recs, company_id)
-            return tx(lambda cur: db.upsert_corporate_actions(cur, rows)) if rows else 0
-        if not has_yf:
-            _dataset(tasks, "yf:nse_actions", nse)
+    # The NSE corporate-actions fallback (undocumented nseindia.com/api with cookie warming) was removed:
+    # yfinance is the only source of corporate actions here.
+    log.info("nse_fallback_removed")
 
     for task in tasks:
         db.record_task(run_id, company_id, task.task, task.status, http_status=task.http_status,

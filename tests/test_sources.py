@@ -102,3 +102,79 @@ class TestOthers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSecondWave(unittest.TestCase):
+    def test_fpi_latest(self):
+        from screener_scraper.sources import nsdl_fpi
+        rows = nsdl_fpi.parse_latest((FX / "fpi_latest.html").read_text(encoding="utf8"))
+        self.assertEqual(rows[0][:4], (date(2026, 10, 30), "Equity", "Stock Exchange", 13626.03))
+        self.assertEqual(rows[0][5], -812.73)                                     # (812.73) is negative
+        self.assertEqual(rows[-1][1:3], ("Total", "Total"))
+        self.assertFalse(any("Futures" in r[1] for r in rows))                    # derivatives table excluded
+        self.assertEqual(len({r[:3] for r in rows}), len(rows))
+
+    def test_fpi_sector(self):
+        from screener_scraper.sources import nsdl_fpi
+        rows = nsdl_fpi.parse_sector((FX / "fpi_sector.html").read_text(encoding="utf8"), date(2025, 10, 15))
+        self.assertTrue(rows)
+        first = [r for r in rows if r[1] == "Automobile and Auto Components" and r[2] == "auc_prev" and r[3] == "Equity"][0]
+        self.assertEqual((first[4], first[5]), (569410.0, 64128.0))
+        self.assertIn("MF Equity", {r[3] for r in rows})
+        self.assertEqual(len({r[:4] for r in rows}), len(rows))
+        self.assertEqual(list(nsdl_fpi.fortnight_ends(date(2025, 10, 1), date(2025, 11, 20))),
+                         [date(2025, 10, 15), date(2025, 10, 31), date(2025, 11, 15)])
+
+    def test_mospi(self):
+        from screener_scraper.sources import mospi
+        cpi = mospi.parse_cpi(json.loads((FX / "mospi_cpi.json").read_text()))
+        self.assertTrue(cpi and all(r[3] == "2012" and r[1] == date(2025, 12, 1) for r in cpi))
+        self.assertTrue(all("CPI_2012" in r[0] for r in cpi))
+        iip = mospi.parse_iip(json.loads((FX / "mospi_iip.json").read_text()))
+        self.assertTrue(any(r[0].endswith("INDEX") and r[3] == "2011-12" for r in iip))
+        wpi = mospi.parse_wpi(json.loads((FX / "mospi_wpi.json").read_text()))
+        self.assertEqual(wpi, [("MOSPI_WPI_201112_ALL_INDEX", date(2024, 12, 1), 155.7, "2011-12")])
+
+    def test_cm_bhav_formats(self):
+        from screener_scraper.sources import nse_cm_bhav as m
+        old = m.parse_zip((FX / "cm_old_small.zip").read_bytes(), date(2010, 1, 4))
+        self.assertEqual((old[0]["symbol"], old[0]["series"], old[0]["date"], old[0]["close"]),
+                         ("20MICRONS", "EQ", date(2010, 1, 4), 47.55))
+        full = m.to_full_rows(old)
+        self.assertEqual(full[0][2], date(2010, 1, 4))
+        self.assertAlmostEqual(full[0][11], 1719201.35 / 1e5)
+        new = m.parse_zip((FX / "cm_udiff_small.zip").read_bytes(), date(2026, 10, 30))
+        self.assertTrue(new and new[0]["isin"].startswith("IN") and new[0]["date"] == date(2026, 10, 30))
+
+    def test_adj_factor(self):
+        from screener_scraper.sources.adj_factor import factor_for
+        self.assertAlmostEqual(factor_for("split", 5.0), 0.2)
+        self.assertAlmostEqual(factor_for("bonus", 1.5), 1 / 1.5)
+        self.assertAlmostEqual(factor_for("dividend", 10.0, 1000.0), 0.99)
+        self.assertIsNone(factor_for("dividend", 10.0, None))
+        self.assertIsNone(factor_for("split", None))
+        self.assertIsNone(factor_for("rights", 2.0))
+
+    def test_mf_holding_tolerant_parser(self):
+        """SYNTHETIC layout (no real AMC file is obtainable without JS/blocked pages): headers differ per fund house."""
+        import io
+        import openpyxl
+        from screener_scraper.sources import amc_portfolio as a
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "EQ"
+        ws.append(["Axis Bluechip Fund"])
+        ws.append(["Monthly Portfolio Statement as on October 31, 2026"])
+        ws.append(["Name of the Instrument", "ISIN", "Industry", "Quantity", "Market/Fair Value (Rs. in Lakhs)", "% to NAV"])
+        ws.append(["HDFC Bank Ltd", "INE040A01034", "Banks", 100000, 1500.5, 9.8])
+        ws.append(["Reliance Industries Ltd", "INE002A01018", "Oil", "250,000", "3,000", 12.1])
+        ws.append(["Net Receivables", "", "", "", 10, 0.1])
+        buf = io.BytesIO()
+        wb.save(buf)
+        rows = a.parse_file(buf.getvalue(), "x.xlsx", "Axis", date(2026, 10, 31), {"INE002A01018": 7})
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][1:5], ("Axis", "Axis Bluechip Fund", "INE040A01034", None))
+        self.assertAlmostEqual(rows[0][7], 15.005)                                # lakh -> crore
+        self.assertEqual((rows[1][4], rows[1][6], rows[1][8]), (7, 250000.0, 12.1))
+        self.assertEqual(a.month_from_text("Portfolio_October_2026.xlsx"), date(2026, 10, 31))
+        self.assertIsNone(a.match_header(["a", "b"]))

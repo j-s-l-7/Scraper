@@ -87,7 +87,9 @@ def lake_url() -> str:
 
 
 def _run(*cmd, check=True, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(list(cmd), check=check, capture_output=True, text=True, **kw)
+    # postgres refuses to start ("postmaster became multithreaded") on macOS without a valid locale
+    env = {**os.environ, "LC_ALL": os.environ.get("LC_ALL") or "en_US.UTF-8", **kw.pop("env", {})}
+    return subprocess.run(list(cmd), check=check, capture_output=True, text=True, env=env, **kw)
 
 
 def lake_running() -> bool:
@@ -98,7 +100,7 @@ def lake_up() -> str:
     """Idempotent: init the cluster, start it if down, create the database, apply every migration."""
     LAKE_DIR.mkdir(parents=True, exist_ok=True)
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-    bin_major = _run(pg_bin("pg_ctl"), "--version").stdout.split()[-1].split(".")[0]
+    bin_major = re.search(r"\)\s*(\d+)", _run(pg_bin("pg_ctl"), "--version").stdout).group(1)   # "pg_ctl (PostgreSQL) 15.4 (Homebrew)"
     if (PGDATA / "PG_VERSION").exists() and (PGDATA / "PG_VERSION").read_text().strip() != bin_major:
         if lake_running():
             _run(pg_bin("pg_ctl"), "-D", str(PGDATA), "stop", "-m", "fast", check=False)

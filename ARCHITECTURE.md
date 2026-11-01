@@ -311,3 +311,26 @@ Static export (`output: 'export'`) served by FastAPI, so one process serves ever
 * **Ops** (`/ops`): pipeline runs, job queue by kind and status, failures by error class, DB size against the 500 MB cap, and document completeness.
 * Keyboard: `/` focuses search, `g s` goes to securities, `g l` goes to the library. Light and dark themes. Number formatting uses Indian
   grouping (₹ 1,23,456 Cr).
+
+## 12. Public sources in the local lake (second wave)
+Loaded by `python -m screener_scraper sources` into the LAKE only (never Supabase), one module per source in
+`screener_scraper/sources/`, migrations `sql/090-106`, daily via `refresh.sh` (`sources --daily`, gated by the
+`equity.control` row `source:<name>`). Plain static or officially documented GETs only; a 401/403/429/bot-check is final
+for the run (`blocked_on` marker). Every table carries `source` and `fetched_at`.
+
+| source | tables | notes |
+|---|---|---|
+| NSE/BSE/F&O bhavcopies, bulk/block | `nse_bhav_full`, `bse_bhav`, `fo_bhav`, `bulk_block_deal` | static archive files |
+| NSE old-format + UDiFF CM bhavcopies | `listing_history`, `universe_pit` | survivorship-bias fix; `universe --pit-date D --top N` |
+| corporate-action adjustment | `adj_factor`, view `v_prices_adjusted` | split/bonus/dividend factors; dq check vs yfinance adj_close (0.5%) |
+| NSDL FPI Monitor | `macro.fpi_flow_daily`, `macro.fpi_sector_fortnightly` | daily history accrues from the Latest page |
+| MoSPI eSankhyiki | `macro.series_monthly` | CPI base 2012 and 2024 are separate codes, not spliced |
+| AMC monthly portfolios | `equity.mf_holding` | tolerant header-matching parser; most AMC pages are JS-rendered or block bots |
+| yfinance / World Bank | `macro.series_daily`, `macro.series_annual` | RBI DBIE has no static file URL; rbi.org.in answers bots with 418 |
+
+The undocumented `nseindia.com/api` corporate-actions fallback (cookie warming) was removed from `yf.py` (log line
+`nse_fallback_removed`); corporate actions come from yfinance only.
+
+**Future, licensed item: XBRL reconciliation.** Reconciling Screener's standardised fundamentals to the exchange XBRL
+filings is skipped: there is no free bulk XBRL feed. It needs a licensed NSE/BSE corporate-data feed (or CMIE/C-MOTS)
+if the use ever turns commercial.

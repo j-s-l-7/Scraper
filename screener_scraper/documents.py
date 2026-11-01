@@ -127,12 +127,7 @@ def _session() -> requests.Session:
 
 
 def doc_headers(url: str) -> dict:
-    h = urlparse(url).netloc.lower()
-    if "bseindia" in h:
-        return {"Referer": "https://www.bseindia.com/"}
-    if "nseindia" in h:
-        return {"Referer": "https://www.nseindia.com/"}
-    return {}
+    return {}      # plain GETs only: no Referer / cookie tricks
 
 
 def download(url: str, spacer: Spacer = None, tries: int = 3) -> bytes:

@@ -102,18 +102,13 @@ def get_connection():
 # ----- NSE fetch -----
 
 def make_session() -> requests.Session:
-    """A cookie-primed session — NSE archives reject naked requests."""
+    """Plain session for the static nsearchives files (no cookie warming, no spoofed headers)."""
     s = requests.Session()
     s.headers.update({
         "User-Agent": _UA,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
     })
-    try:
-        s.get("https://www.nseindia.com/", timeout=15)
-    except requests.RequestException as exc:
-        logger.warning(f"cookie prime failed (continuing): {exc}")
     return s
 
 

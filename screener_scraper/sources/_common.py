@@ -13,6 +13,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence
 from urllib.parse import urlparse
 
 import requests
+import requests.adapters
 from psycopg2.extras import execute_values
 
 from .. import config
@@ -51,10 +52,24 @@ def _host_wait(host: str, interval: float) -> None:
         f.flush()
 
 
+class LegacyTLSAdapter(requests.adapters.HTTPAdapter):
+    """Some official hosts (api.mospi.gov.in) still use TLS legacy renegotiation, which OpenSSL 3 refuses by default.
+    Re-enabling it is a client TLS compatibility setting only: no headers, cookies or access controls are touched."""
+
+    def init_poolmanager(self, *a, **kw):
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+        kw["ssl_context"] = ctx
+        super().init_poolmanager(*a, **kw)
+
+
 class Fetcher:
-    def __init__(self, interval: float = MIN_HOST_INTERVAL):
+    def __init__(self, interval: float = MIN_HOST_INTERVAL, legacy_tls_hosts: Sequence[str] = ()):
         self.s = requests.Session()
         self.s.headers["User-Agent"] = UA
+        for h in legacy_tls_hosts:
+            self.s.mount(f"https://{h}", LegacyTLSAdapter())
         self.interval = max(interval, MIN_HOST_INTERVAL)
         self._robots: Dict[str, Optional[urllib.robotparser.RobotFileParser]] = {}
 
@@ -161,7 +176,8 @@ def set_marker(db, name: str, **kv) -> dict:
     return m
 
 
-def upsert(db, table: str, cols: Sequence[str], pk: Sequence[str], rows: List[tuple], page: int = 5000) -> int:
+def upsert(db, table: str, cols: Sequence[str], pk: Sequence[str], rows: List[tuple], page: int = 5000,
+           ts_col: str = "loaded_at") -> int:
     """INSERT ... ON CONFLICT (pk) DO UPDATE in one transaction; rows deduplicated on the pk (last wins)."""
     if not rows:
         return 0
@@ -170,7 +186,7 @@ def upsert(db, table: str, cols: Sequence[str], pk: Sequence[str], rows: List[tu
     rows = list(d.values())
     upd = [c for c in cols if c not in pk]
     sql = (f"insert into {table} ({', '.join(cols)}) values %s on conflict ({', '.join(pk)}) do update set "
-           + ", ".join(f"{c}=excluded.{c}" for c in upd) + ", loaded_at=now()")
+           + ", ".join(f"{c}=excluded.{c}" for c in upd) + f", {ts_col}=now()")
 
     def tx(cur):
         for i in range(0, len(rows), page):
@@ -215,7 +231,7 @@ def ensure_companies(db) -> int:
 # ───────── generic per-day runner for date-addressed files ─────────
 def run_days(db, name: str, since: Optional[date], until: Optional[date], default_since: date, floor: date,
              table: str, load_day: Callable[[date], Optional[int]], fetch_cls_blocked=Blocked,
-             force_all: bool = False) -> dict:
+             force_all: bool = False, skip_have: bool = True) -> dict:
     """since=None resumes from the marker. load_day(d) returns rows loaded or None for 'not published' (holiday).
     The marker only advances over contiguous definitive days; today's 404 is not definitive."""
     marker = get_marker(db, name)
@@ -229,7 +245,7 @@ def run_days(db, name: str, since: Optional[date], until: Optional[date], defaul
         last = marker.get("last_date")
         since = date.fromisoformat(last) + timedelta(days=1) if last else default_since
     since = max(since, floor)
-    have = set() if force_all else (loaded_dates(db, table) if backfill else set())
+    have = set() if (force_all or not skip_have) else (loaded_dates(db, table) if backfill else set())
     rows = days = miss = 0
     status = "ok"
     last_ok = None

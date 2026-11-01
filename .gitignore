@@ -49,3 +49,5 @@ console/web/out/
 /*.txt
 data/.*
 !/requirements.txt
+research_notes/
+reports/

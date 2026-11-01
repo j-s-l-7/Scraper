@@ -49,8 +49,7 @@ def fetch_candidates(client: Client) -> List[Tuple[str, Optional[str], Optional[
     errs = []
     for url in [EQUITY_L_URL] + NIFTY_FALLBACKS:
         try:
-            r = client.get(url, "_universe", "cand_" + url.rsplit("/", 1)[-1],
-                           headers={"Referer": "https://www.nseindia.com/"})
+            r = client.get(url, "_universe", "cand_" + url.rsplit("/", 1)[-1])
             cands = parse_candidates(r.text)
             if len(cands) > 100:
                 log.info("candidates: %d symbols from %s", len(cands), url)

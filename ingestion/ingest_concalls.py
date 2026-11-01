@@ -186,7 +186,6 @@ def download_pdf(cc: Concall) -> bool:
     """Fill cc.pdf_bytes + cc.source. Direct first, Wayback fallback."""
     headers = dict(HEADERS)
     if "bseindia.com" in cc.url:
-        headers["Referer"] = "https://www.bseindia.com/"
         candidates = [(cc.url, "bse")]
     else:
         candidates = [(cc.url, "ir_site")]

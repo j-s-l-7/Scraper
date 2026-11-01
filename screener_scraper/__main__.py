@@ -65,6 +65,8 @@ def main(argv=None) -> int:
     u.add_argument("--candidates", default="nifty500", help="'nifty500' or path to a CSV with a Symbol column")
     u.add_argument("--limit-candidates", type=int, default=None)
     u.add_argument("--universe", default=config.UNIVERSE_CODE)
+    u.add_argument("--pit-date", help="YYYY-MM-DD: build point-in-time membership as of that date in the LAKE "
+                                      "(top --top by 90-day average turnover from equity.nse_bhav_full, delisted names included)")
     s = sub.add_parser("scrape", help="scrape companies")
     s.add_argument("--symbols", help="comma separated NSE symbols / screener slugs")
     s.add_argument("--universe", default=config.UNIVERSE_CODE, help="universe code (latest as_of) when no --symbols")
@@ -122,7 +124,7 @@ def main(argv=None) -> int:
     ld = sub.add_parser("load-documents", help="bulk-load local jsonl.gz into equity.document_page (needs a bigger DB)")
     ld.add_argument("--limit", type=int)
     so = sub.add_parser("sources", help="public sources -> local lake (nse_bhav_full,bse_bhav,bulk_block,fo_bhav,"
-                                         "credit_ratings,macro,gdelt_news)")
+                                         "credit_ratings,macro,gdelt_news,nsdl_fpi,mospi,amc_portfolio,nse_cm_bhav,adj_factor)")
     so.add_argument("--only", help="comma separated source names (default: all)")
     so.add_argument("--backfill-from", help="YYYY-MM-DD: per-day backfill from this date (skips days already loaded)")
     so.add_argument("--daily", action="store_true", help="only sources not yet run today (control-row marker); for refresh.sh")
@@ -164,6 +166,16 @@ def main(argv=None) -> int:
     if a.cmd == "lake-up":
         from .lake import lake_up
         print(lake_up())
+        return 0
+    if a.cmd == "universe" and a.pit_date:
+        from .db import DB
+        from .lake import lake_url
+        from .sources.nse_cm_bhav import build_pit_universe
+        ldb = DB(lake_url())
+        try:
+            print("pit members:", build_pit_universe(ldb, date.fromisoformat(a.pit_date), a.top))
+        finally:
+            ldb.close()
         return 0
     if a.cmd == "sources":
         from .db import DB

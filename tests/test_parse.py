@@ -323,17 +323,8 @@ class Yf(unittest.TestCase):
         r1, r2 = self.yf.insider_rows(ins, 1), self.yf.insider_rows(ins, 1)
         assert r1 == r2 and len(r1) == 1 and r1[0][2] == date(2026, 1, 1) and r1[0][7] == 10
 
-    def test_nse_subjects(self):
-        p = self.yf.parse_nse_subject
-        assert p("Dividend - Rs 12 Per Share") == ("dividend", 12.0)
-        assert p("Interim Dividend - Rs 5.50 Per Share") == ("dividend", 5.5)
-        assert p("Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share") == ("split", 5.0)
-        assert p("Bonus 1:1") == ("bonus", 2.0)
-        assert p("Bonus issue 3:2") == ("bonus", 2.5)
-        assert p("Annual General Meeting") is None
-        rows = self.yf.nse_action_rows([{"subject": "Dividend - Rs 12 Per Share", "exDate": "17-Oct-2025"},
-                                        {"subject": "AGM", "exDate": "01-Jan-2025"}], 3)
-        assert rows == [(3, "dividend", date(2025, 10, 17), 12.0, "Dividend - Rs 12 Per Share", "nse")]
+    def test_nse_fallback_removed(self):
+        assert not hasattr(self.yf, "nse_fetch_actions") and not hasattr(self.yf, "parse_nse_subject")
 
 
 class Throttle(unittest.TestCase):
