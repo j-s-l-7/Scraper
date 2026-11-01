@@ -69,6 +69,9 @@ def run_lake_runner(from_rank: int, to_rank: int, k: int, n: int, explicit: Opti
     dst = DB()                                   # DATABASE_URL = runner-local PG
     # migrations were applied by the workflow's init-db step (re-applying fails: views are redefined across files)
     mine = runner_ranks(window_ranks(from_rank, to_rank, explicit), k, n)
+    if not mine:
+        log.info("runner %d/%d has no ranks in this window; nothing to do", k, n)
+        return 0
     chosen = seed(src, dst, mine)
     src.close()
     log.info("runner %d/%d: ranks %s -> %d companies in universe", k, n, mine, len(chosen))
