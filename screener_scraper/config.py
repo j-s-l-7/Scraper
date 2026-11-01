@@ -59,6 +59,10 @@ def database_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL not set (see .env)")
+    # CI fans out to 20 runners; Supabase's session pooler (5432) caps at 15 clients,
+    # so runners use the transaction pooler (6543), which is sized for many short clients.
+    if os.environ.get("GITHUB_ACTIONS") == "true" and "pooler.supabase.com:5432" in url:
+        url = url.replace("pooler.supabase.com:5432", "pooler.supabase.com:6543")
     return url
 
 
