@@ -43,7 +43,7 @@ def _url(target: str) -> str:
 def _new_pool(target: str) -> psycopg2.pool.ThreadedConnectionPool:
     return psycopg2.pool.ThreadedConnectionPool(
         1, 4, _url(target), connect_timeout=15,
-        options="-c statement_timeout=25000 -c default_transaction_read_only=on", **KEEPALIVES)
+        options="-c default_transaction_read_only=on", **KEEPALIVES)
 
 
 def _get_pool(target: str) -> psycopg2.pool.ThreadedConnectionPool:
@@ -85,6 +85,8 @@ def _conn(target: str):
         if conn.closed:
             raise psycopg2.InterfaceError("connection already closed")
         conn.set_session(readonly=True, autocommit=True)
+        with conn.cursor() as cur:  # Supabase's pooler drops startup options, so set the timeout per session
+            cur.execute("set statement_timeout = 60000")
         yield conn
     except (psycopg2.InterfaceError, psycopg2.OperationalError):
         ok = False
