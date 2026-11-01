@@ -25,7 +25,7 @@ _pool_lock = threading.Lock()
 
 def _new_pool() -> psycopg2.pool.ThreadedConnectionPool:
     return psycopg2.pool.ThreadedConnectionPool(
-        1, 4, config.database_url(), connect_timeout=15,
+        1, 4, config.database_url(session=True), connect_timeout=15,
         options="-c statement_timeout=25000 -c default_transaction_read_only=on", **KEEPALIVES)
 
 

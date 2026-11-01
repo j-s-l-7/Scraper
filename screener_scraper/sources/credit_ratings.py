@@ -118,7 +118,7 @@ def read_text(rel_path: str) -> str:
 
 
 def source_links():
-    src = psycopg2.connect(config.database_url(), connect_timeout=20)
+    src = psycopg2.connect(config.database_url(session=True), connect_timeout=20)
     src.set_session(readonly=True, autocommit=True)
     with src.cursor() as cur:
         cur.execute("select company_id, url, period_label, source from equity.document_link where doc_type='credit_rating' "

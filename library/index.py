@@ -109,7 +109,7 @@ def catalog(symbols: list[str] | None = None) -> list[dict]:
     if symbols:
         sql += " and c.nse_symbol = any(%s)"
         params.append(symbols)
-    con = psycopg2.connect(config.database_url(), keepalives=1, keepalives_idle=30)
+    con = psycopg2.connect(config.database_url(session=True), keepalives=1, keepalives_idle=30)
     try:
         con.set_session(readonly=True, autocommit=True)
         cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)

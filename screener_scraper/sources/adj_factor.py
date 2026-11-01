@@ -38,7 +38,7 @@ def factor_for(kind: str, value: Optional[float], prev_close: Optional[float] = 
 def sync_from_supabase(db) -> Dict[str, int]:
     """Read-only copy of corporate_action and historical_prices (>= 2019-09-01) for companies in the lake."""
     c.ensure_companies(db)
-    src = psycopg2.connect(config.database_url(), connect_timeout=20)
+    src = psycopg2.connect(config.database_url(session=True), connect_timeout=20)
     src.set_session(readonly=True, autocommit=True)
     out = {}
     with src.cursor() as cur:

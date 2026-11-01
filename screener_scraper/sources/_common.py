@@ -212,7 +212,7 @@ def ensure_companies(db) -> int:
     if n:
         return n
     import psycopg2
-    src = psycopg2.connect(config.database_url(), connect_timeout=20)
+    src = psycopg2.connect(config.database_url(session=True), connect_timeout=20)
     src.set_session(readonly=True, autocommit=True)
     with src.cursor() as c:
         c.execute("select * from equity.company")

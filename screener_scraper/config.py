@@ -54,7 +54,10 @@ def load_env() -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def database_url() -> str:
+def database_url(session: bool = False) -> str:
+    """session=True keeps Supabase's session pooler (5432): required by any client that sets
+    session-level state (e.g. the read-only console), which would leak to other clients
+    through the transaction pooler's shared server connections."""
     load_env()
     url = os.environ.get("DATABASE_URL")
     if not url:
@@ -63,7 +66,7 @@ def database_url() -> str:
     # console and checks exceed it. The transaction pooler (6543) is sized for many short clients
     # and works with everything here (no session state, LISTEN or server-side prepared statements).
     # DB_SESSION_POOLER=1 opts back into 5432.
-    if os.environ.get("DB_SESSION_POOLER") != "1" and "pooler.supabase.com:5432" in url:
+    if not session and os.environ.get("DB_SESSION_POOLER") != "1" and "pooler.supabase.com:5432" in url:
         url = url.replace("pooler.supabase.com:5432", "pooler.supabase.com:6543")
     return url
 
