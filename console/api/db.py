@@ -1,9 +1,14 @@
-"""Read-only Postgres access: small pool, keepalives, reconnect on dropped connections, TTL cache."""
+"""Read-only Postgres access: small pool, keepalives, reconnect on dropped connections, TTL cache.
+
+Two targets: "lake" (local Postgres, every company incl. the top 100; the default for data pages) and
+"supabase" (the top-100 store plus the job queue and storage guard; used by Ops). CONSOLE_DB=supabase
+points the data pages back at Supabase."""
 from __future__ import annotations
 
 import datetime as dt
 import decimal
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -19,33 +24,43 @@ log = logging.getLogger("console.db")
 KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
 CACHE_TTL = 60.0
 
-_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pools: dict[str, psycopg2.pool.ThreadedConnectionPool] = {}
 _pool_lock = threading.Lock()
 
 
-def _new_pool() -> psycopg2.pool.ThreadedConnectionPool:
+def default_target() -> str:
+    config.load_env()
+    return "supabase" if os.environ.get("CONSOLE_DB") == "supabase" else "lake"
+
+
+def _url(target: str) -> str:
+    if target == "lake":
+        from screener_scraper.lake import lake_url
+        return lake_url()
+    return config.database_url(session=True)
+
+
+def _new_pool(target: str) -> psycopg2.pool.ThreadedConnectionPool:
     return psycopg2.pool.ThreadedConnectionPool(
-        1, 4, config.database_url(session=True), connect_timeout=15,
+        1, 4, _url(target), connect_timeout=15,
         options="-c statement_timeout=25000 -c default_transaction_read_only=on", **KEEPALIVES)
 
 
-def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
-    global _pool
+def _get_pool(target: str) -> psycopg2.pool.ThreadedConnectionPool:
     with _pool_lock:
-        if _pool is None:
-            _pool = _new_pool()
-        return _pool
+        if target not in _pools:
+            _pools[target] = _new_pool(target)
+        return _pools[target]
 
 
-def reset_pool() -> None:
-    global _pool
+def reset_pool(target: str) -> None:
     with _pool_lock:
-        if _pool is not None:
-            try:
-                _pool.closeall()
-            except Exception:
-                pass
-        _pool = None
+        pool = _pools.pop(target, None)
+    if pool is not None:
+        try:
+            pool.closeall()
+        except Exception:
+            pass
 
 
 def clean(v: Any) -> Any:
@@ -62,8 +77,8 @@ def clean(v: Any) -> Any:
 
 
 @contextmanager
-def _conn():
-    pool = _get_pool()
+def _conn(target: str):
+    pool = _get_pool(target)
     conn = pool.getconn()
     ok = True
     try:
@@ -81,12 +96,13 @@ def _conn():
             pass
 
 
-def query(sql: str, params: tuple | list | dict | None = None, *, raw: bool = False) -> list[dict]:
+def query(sql: str, params: tuple | list | dict | None = None, *, raw: bool = False, target: str | None = None) -> list[dict]:
     """Run a parameterised SELECT; reconnect (twice) on InterfaceError / OperationalError."""
+    target = target or default_target()
     last: Exception | None = None
     for attempt in range(3):
         try:
-            with _conn() as conn:
+            with _conn(target) as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(sql, params)
                     rows = cur.fetchall()
@@ -95,14 +111,14 @@ def query(sql: str, params: tuple | list | dict | None = None, *, raw: bool = Fa
             last = e
             log.warning("db connection problem (%s), retry %d", type(e).__name__, attempt + 1)
             if attempt == 1:
-                reset_pool()
+                reset_pool(target)
             time.sleep(0.3 * (attempt + 1))
     assert last is not None
     raise last
 
 
-def one(sql: str, params=None) -> dict | None:
-    rows = query(sql, params)
+def one(sql: str, params=None, *, target: str | None = None) -> dict | None:
+    rows = query(sql, params, target=target)
     return rows[0] if rows else None
 
 

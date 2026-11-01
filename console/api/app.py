@@ -28,7 +28,7 @@ from . import db
 ROOT = Path(__file__).resolve().parents[2]
 WEB_OUT = ROOT / "console" / "web" / "out"
 DOCS_ROOT = (ROOT / "data" / "documents").resolve()
-UNIVERSE = "TOP100_MCAP"
+UNIVERSE = "TOP100_MCAP" if db.default_target() == "supabase" else "TOP1000_MCAP"
 
 SCREENER_SECTIONS = ["quarters", "profit-loss", "balance-sheet", "cash-flow", "ratios"]
 YF_SECTIONS = ["yf-income", "yf-balance", "yf-cashflow"]
@@ -613,35 +613,48 @@ def library_search(q: str = Query("", max_length=300), symbols: str | None = Non
 # --------------------------------------------------------------------------- ops
 @app.get("/api/ops")
 def ops():
-    def load():
-        runs = db.query("select run_id, command, status, params, stats, host, started_at, finished_at from equity.scrape_run order by run_id desc limit 20")
-        jobs = db.query("select kind, status, count(*) n from equity.job group by 1, 2 order by 1, 2")
-        job_fail = db.query("select kind, coalesce(error_class, 'unknown') as error_class, count(*) n from equity.job "
-                            "where status in ('retry','dead') group by 1, 2 order by n desc")
-        task_fail = db.query("select split_part(task, ':', 1) as task, left(coalesce(error, 'no error text'), 90) as error, count(*) n "
-                             "from equity.scrape_task where status = 'failed' group by 1, 2 order by n desc limit 20")
-        size = db.one("select pg_database_size(current_database()) as bytes")
-        limit = db.one("select value from equity.control where key = 'storage_limit_mb'")
-        control = db.query("select key, value, reason, updated_at from equity.control order by key")
-        tables = db.query(
-            """select c.relname as name, pg_total_relation_size(c.oid) as bytes, c.reltuples::bigint as est_rows
-               from pg_class c join pg_namespace n on n.oid = c.relnamespace
-               where n.nspname = 'equity' and c.relkind = 'r' order by 2 desc limit 10""")
-        docs = db.query("select doc_type, status, count(*) n from equity.document group by 1, 2 order by 1, 2")
-        comp = db.one("select sum(ar_expected) ar_expected, sum(ar_found) ar_found, sum(cc_expected) cc_expected, sum(cc_found) cc_found, "
-                      "sum(ppt_expected) ppt_expected, sum(ppt_found) ppt_found, count(*) companies from equity.v_document_completeness")
-        gaps = db.query("select nse_symbol as symbol, ar_expected - ar_found as ar_gap, cc_expected - cc_found as cc_gap, ar_found, ar_expected, cc_found, cc_expected "
-                        "from equity.v_document_completeness order by (ar_expected - ar_found) + (cc_expected - cc_found) desc limit 12")
-        return {"runs": runs, "jobs": jobs, "job_failures": job_fail, "task_failures": task_fail,
-                "db": {"bytes": size["bytes"], "limit_mb": limit["value"] if limit else 500, "cap_mb": 500, "tables": tables},
-                "control": control, "documents": docs, "completeness": comp, "completeness_gaps": gaps}
-    out = db.cached("ops", load)
+    out = db.cached("ops", _load_ops, ttl=OPS_TTL)
     return {**out, "library": library_stats()}
+
+
+OPS_TTL = 900.0  # refreshed by the warm loop every ~5 min; the completeness view is slow on Supabase
+
+
+def _load_ops() -> dict:
+    # the job queue, storage guard and run log live in Supabase, whatever the data pages read
+    def q(sql, params=None):
+        return db.query(sql, params, target="supabase")
+
+    def o(sql, params=None):
+        return db.one(sql, params, target="supabase")
+
+    runs = q("select run_id, command, status, params, stats, host, started_at, finished_at from equity.scrape_run order by run_id desc limit 20")
+    jobs = q("select kind, status, count(*) n from equity.job group by 1, 2 order by 1, 2")
+    job_fail = q("select kind, coalesce(error_class, 'unknown') as error_class, count(*) n from equity.job "
+                 "where status in ('retry','dead') group by 1, 2 order by n desc")
+    task_fail = q("select split_part(task, ':', 1) as task, left(coalesce(error, 'no error text'), 90) as error, count(*) n "
+                  "from equity.scrape_task where status = 'failed' group by 1, 2 order by n desc limit 20")
+    size = o("select pg_database_size(current_database()) as bytes")
+    limit = o("select value from equity.control where key = 'storage_limit_mb'")
+    control = q("select key, value, reason, updated_at from equity.control order by key")
+    tables = q(
+        """select c.relname as name, pg_total_relation_size(c.oid) as bytes, c.reltuples::bigint as est_rows
+           from pg_class c join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = 'equity' and c.relkind = 'r' order by 2 desc limit 10""")
+    docs = q("select doc_type, status, count(*) n from equity.document group by 1, 2 order by 1, 2")
+    comp = o("select sum(ar_expected) ar_expected, sum(ar_found) ar_found, sum(cc_expected) cc_expected, sum(cc_found) cc_found, "
+             "sum(ppt_expected) ppt_expected, sum(ppt_found) ppt_found, count(*) companies from equity.v_document_completeness")
+    gaps = q("select nse_symbol as symbol, ar_expected - ar_found as ar_gap, cc_expected - cc_found as cc_gap, ar_found, ar_expected, cc_found, cc_expected "
+             "from equity.v_document_completeness order by (ar_expected - ar_found) + (cc_expected - cc_found) desc limit 12")
+    return {"runs": runs, "jobs": jobs, "job_failures": job_fail, "task_failures": task_fail,
+            "db": {"bytes": size["bytes"], "limit_mb": limit["value"] if limit else 500, "cap_mb": 500, "tables": tables},
+            "control": control, "documents": docs, "completeness": comp, "completeness_gaps": gaps}
 
 
 def _warm_loop() -> None:
     """Keep the hot, slow-to-compute payloads fresh so /api/securities is always served from memory."""
     import time
+    n = 0
     while True:
         try:
             companies()
@@ -649,6 +662,12 @@ def _warm_loop() -> None:
             doc_catalog()
         except Exception as e:  # DB asleep, network: try again next round
             db.log.warning("warm loop: %s", e)
+        if n % 7 == 0:
+            try:
+                db.put("ops", _load_ops())
+            except Exception as e:
+                db.log.warning("warm loop (ops): %s", e)
+        n += 1
         time.sleep(45)
 
 
