@@ -106,6 +106,9 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
 
 
 def run_fleet_worker(role: str, index: int, of: int, once: bool = False) -> int:
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)   # `kill -USR1 <pid>`: every thread's stack -> the log
     os.environ.setdefault("SUPABASE_TXN_POOL", "1")
     src_url = os.environ.get("SOURCE_DATABASE_URL")
     if not src_url:

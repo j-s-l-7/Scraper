@@ -37,10 +37,25 @@ start_one() {
   echo "started $name ($role $idx/$of) pid $(cat data/fleet/$name.pid)"
 }
 
+# A healthy worker writes to its log at least every 30 min (longest sleep between passes). One silent for STALE_MIN
+# is hung: dump its Python stacks into the log (SIGUSR1, see fleet.py), then kill it; its loop restarts it in ~20s.
+STALE_MIN=${FLEET_STALE_MIN:-60}
+unstick() {
+  local name=$1 c
+  alive "$name" || return 0
+  [ -n "$(find "logs/fleet_$name.log" -mmin +$STALE_MIN 2>/dev/null)" ] || return 0
+  for c in $(pgrep -P "$(cat "data/fleet/$name.pid")"); do
+    case "$(ps -o comm= -p "$c" 2>/dev/null)" in
+      *[Pp]ython*) kill -USR1 "$c" 2>/dev/null; sleep 2; kill "$c" 2>/dev/null
+                   echo "[fleet $name] log silent ${STALE_MIN}+ min: stack dumped, restarted pid $c" | tee -a "logs/fleet_$name.log" ;;
+    esac
+  done
+}
+
 case "${1:-status}" in
   start)
     "$PY" -m screener_scraper lake-up >/dev/null 2>&1 || { echo "lake-up failed"; exit 1; }
-    for p in $PROCS; do IFS=: read -r name role idx of <<<"$p"; start_one "$name" "$role" "$idx" "$of"; done ;;
+    for p in $PROCS; do IFS=: read -r name role idx of <<<"$p"; start_one "$name" "$role" "$idx" "$of"; unstick "$name"; done ;;
   stop)
     for p in $PROCS; do name=${p%%:*}
       if alive "$name"; then pid=$(cat data/fleet/$name.pid); pkill -P "$pid" 2>/dev/null; pkill -P "$(pgrep -P "$pid" | head -1)" 2>/dev/null; kill "$pid" 2>/dev/null; fi
