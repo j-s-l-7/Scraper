@@ -645,10 +645,17 @@ def _load_ops() -> dict:
            from pg_class c join pg_namespace n on n.oid = c.relnamespace
            where n.nspname = 'equity' and c.relkind = 'r' order by 2 desc limit 10""")
     docs = q("select doc_type, status, count(*) n from equity.document group by 1, 2 order by 1, 2")
-    comp = o("select sum(ar_expected) ar_expected, sum(ar_found) ar_found, sum(cc_expected) cc_expected, sum(cc_found) cc_found, "
-             "sum(ppt_expected) ppt_expected, sum(ppt_found) ppt_found, count(*) companies from equity.v_document_completeness")
-    gaps = q("select nse_symbol as symbol, ar_expected - ar_found as ar_gap, cc_expected - cc_found as cc_gap, ar_found, ar_expected, cc_found, cc_expected "
-             "from equity.v_document_completeness order by (ar_expected - ar_found) + (cc_expected - cc_found) desc limit 12")
+    # one pass over the (slow) completeness view, limited to the Supabase top 100; totals and gaps computed here
+    rows = q("select nse_symbol as symbol, ar_expected, ar_found, cc_expected, cc_found, ppt_expected, ppt_found "
+             "from equity.v_document_completeness where company_id in (select company_id from equity.universe "
+             "where universe_code = %s and as_of = (select max(as_of) from equity.universe where universe_code = %s))",
+             ("TOP100_MCAP", "TOP100_MCAP"))
+    keys = ["ar_expected", "ar_found", "cc_expected", "cc_found", "ppt_expected", "ppt_found"]
+    comp = {k: sum(r[k] or 0 for r in rows) for k in keys} | {"companies": len(rows)}
+    gaps = sorted(({"symbol": r["symbol"], "ar_gap": (r["ar_expected"] or 0) - (r["ar_found"] or 0),
+                    "cc_gap": (r["cc_expected"] or 0) - (r["cc_found"] or 0),
+                    **{k: r[k] for k in ("ar_found", "ar_expected", "cc_found", "cc_expected")}} for r in rows),
+                  key=lambda g: g["ar_gap"] + g["cc_gap"], reverse=True)[:12]
     return {"runs": runs, "jobs": jobs, "job_failures": job_fail, "task_failures": task_fail,
             "db": {"bytes": size["bytes"], "limit_mb": limit["value"] if limit else 500, "cap_mb": 500, "tables": tables},
             "control": control, "documents": docs, "completeness": comp, "completeness_gaps": gaps}

@@ -32,7 +32,15 @@ done
 
 # 1b. lake rollout driver (top 1000): load finished equity-lake runs, retry gaps once, dispatch the next window,
 #     daily top-100 sync + equity-docs, weekly equity-shards. Idempotent; never fails; logs one summary line.
-"$PY" -m screener_scraper lake-drive 2>&1 | tail -n 3 || true
+#     Detached with its own lock: artifact downloads can take hours on a slow link and must not hold up the rest.
+if mkdir data/.lake-drive.lock 2>/dev/null; then
+  nohup bash -c "LC_ALL=en_US.UTF-8 '$PY' -m screener_scraper lake-drive; rm -rf data/.lake-drive.lock" \
+    >> "logs/lake_drive_$(date +%F).log" 2>&1 &
+elif [ -n "$(find data/.lake-drive.lock -maxdepth 0 -mmin +600)" ]; then
+  rm -rf data/.lake-drive.lock      # stale (crashed run); the next cycle starts a fresh one
+else
+  echo "lake-drive still running"
+fi
 
 # 1b2. local fleet: restart any dead worker process (idempotent; only starts the ones not running)
 scripts/local-fleet.sh start 2>&1 | tail -n 3 || true

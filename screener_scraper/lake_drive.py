@@ -140,28 +140,24 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
         with conn.cursor() as cur:
             cur.execute("select artifact from public.lake_load_log where run_id=%s and status='loaded'", (run_id,))
             done = {a for (a,) in cur.fetchall()}
-        failed, err = [], ""
+        # each artifact is loaded (and logged) as soon as it lands, so a slow link or a killed process keeps the
+        # progress made so far; the next lake-drive skips what is already loaded
+        failed, err, loaded = [], "", 0
         for name in names:
             if name in done:
                 continue
+            art = dest / name
             try:
                 r = subprocess.run(["gh", "run", "download", str(run_id), "-R", repo(), "-n", name, "-D",
-                                    str(dest / name)], capture_output=True, text=True, timeout=900)
+                                    str(art)], capture_output=True, text=True, timeout=2400)
                 ok = r.returncode == 0
                 err = err or r.stderr.strip()
             except subprocess.TimeoutExpired:
                 ok, err = False, err or f"timeout {name}"
             if not ok:
                 failed.append(name)
-                shutil.rmtree(dest / name, ignore_errors=True)
-        arts = sorted(p for p in dest.iterdir() if p.is_dir())
-        if not names or (failed and not arts):
-            with conn, conn.cursor() as cur:
-                cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
-                            "values (%s,'-',0,0,%s) on conflict (run_id, artifact) do update set status=excluded.status,"
-                            " loaded_at=now()", (run_id, "no_artifacts: " + err[:120]))
-            return totals
-        for art in arts:
+                shutil.rmtree(art, ignore_errors=True)
+                continue
             n_files = len(list((art / "export").glob("*.csv.gz"))) if (art / "export").exists() else 0
             rows = load_export_dir(conn, art / "export") if n_files else {}
             if (art / "documents").exists():
@@ -172,7 +168,15 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
                 cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
                             "values (%s,%s,%s,%s,'loaded') on conflict (run_id, artifact) do update set "
                             "files=excluded.files, rows_loaded=excluded.rows_loaded, status='loaded', loaded_at=now()",
-                            (run_id, art.name, n_files, sum(rows.values())))
+                            (run_id, name, n_files, sum(rows.values())))
+            shutil.rmtree(art, ignore_errors=True)
+            loaded += 1
+        if not names or (failed and not loaded and not done):
+            with conn, conn.cursor() as cur:
+                cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
+                            "values (%s,'-',0,0,%s) on conflict (run_id, artifact) do update set status=excluded.status,"
+                            " loaded_at=now()", (run_id, "no_artifacts: " + err[:120]))
+            return totals
         shutil.rmtree(dest, ignore_errors=True)
         try:        # a run counts as fully loaded only once it has completed AND every artifact was loaded
             st = gh("run", "view", str(run_id), "-R", repo(), "--json", "status", "--jq", ".status").strip()
@@ -182,7 +186,7 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
             with conn, conn.cursor() as cur:
                 cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
                             "values (%s,'__complete__',%s,%s,'loaded') on conflict (run_id, artifact) do update "
-                            "set loaded_at=now()", (run_id, len(arts), sum(totals.values())))
+                            "set loaded_at=now()", (run_id, len(names), sum(totals.values())))
         return totals
     finally:
         if own:
