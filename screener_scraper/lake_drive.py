@@ -130,14 +130,36 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
     dest.mkdir(parents=True, exist_ok=True)
     totals: Dict[str, int] = {}
     try:
-        r = subprocess.run(["gh", "run", "download", str(run_id), "-R", repo(), "-p", f"lake-{run_id}-*", "-D",
-                            str(dest)], capture_output=True, text=True, timeout=3600)
+        # one artifact per gh call with its own timeout: a single stalled transfer of the whole run
+        # once hung the refresher for hours. Artifacts already loaded are skipped.
+        try:
+            names = [n for n in gh("api", f"repos/{repo()}/actions/runs/{run_id}/artifacts", "--paginate",
+                                   "--jq", ".artifacts[].name").split() if n.startswith(f"lake-{run_id}-")]
+        except Exception:
+            names = []
+        with conn.cursor() as cur:
+            cur.execute("select artifact from public.lake_load_log where run_id=%s and status='loaded'", (run_id,))
+            done = {a for (a,) in cur.fetchall()}
+        failed, err = [], ""
+        for name in names:
+            if name in done:
+                continue
+            try:
+                r = subprocess.run(["gh", "run", "download", str(run_id), "-R", repo(), "-n", name, "-D",
+                                    str(dest / name)], capture_output=True, text=True, timeout=900)
+                ok = r.returncode == 0
+                err = err or r.stderr.strip()
+            except subprocess.TimeoutExpired:
+                ok, err = False, err or f"timeout {name}"
+            if not ok:
+                failed.append(name)
+                shutil.rmtree(dest / name, ignore_errors=True)
         arts = sorted(p for p in dest.iterdir() if p.is_dir())
-        if r.returncode != 0 and not arts:
+        if not names or (failed and not arts):
             with conn, conn.cursor() as cur:
                 cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
                             "values (%s,'-',0,0,%s) on conflict (run_id, artifact) do update set status=excluded.status,"
-                            " loaded_at=now()", (run_id, "no_artifacts: " + r.stderr.strip()[:120]))
+                            " loaded_at=now()", (run_id, "no_artifacts: " + err[:120]))
             return totals
         for art in arts:
             n_files = len(list((art / "export").glob("*.csv.gz"))) if (art / "export").exists() else 0
@@ -156,7 +178,7 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
             st = gh("run", "view", str(run_id), "-R", repo(), "--json", "status", "--jq", ".status").strip()
         except Exception:
             st = ""
-        if st == "completed":
+        if st == "completed" and not failed:
             with conn, conn.cursor() as cur:
                 cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
                             "values (%s,'__complete__',%s,%s,'loaded') on conflict (run_id, artifact) do update "
