@@ -9,6 +9,7 @@ import gzip
 import json
 import re
 import sqlite3
+import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -613,11 +614,13 @@ def library_search(q: str = Query("", max_length=300), symbols: str | None = Non
 # --------------------------------------------------------------------------- ops
 @app.get("/api/ops")
 def ops():
-    out = db.cached("ops", _load_ops, ttl=OPS_TTL)
+    with _ops_lock:  # one slow Supabase load at a time; concurrent requests wait for it, not for a connection each
+        out = db.cached("ops", _load_ops, ttl=OPS_TTL)
     return {**out, "library": library_stats()}
 
 
 OPS_TTL = 900.0  # refreshed by the warm loop every ~5 min; the completeness view is slow on Supabase
+_ops_lock = threading.Lock()
 
 
 def _load_ops() -> dict:
@@ -664,7 +667,8 @@ def _warm_loop() -> None:
             db.log.warning("warm loop: %s", e)
         if n % 7 == 0:
             try:
-                db.put("ops", _load_ops())
+                with _ops_lock:
+                    db.put("ops", _load_ops())
             except Exception as e:
                 db.log.warning("warm loop (ops): %s", e)
         n += 1
