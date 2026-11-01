@@ -48,6 +48,7 @@ jobs:
       PGUSER: postgres
       PGPASSWORD: postgres
       SOURCE_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_TXN_POOL: "1"          # read-only seeding via the transaction pooler (20 runners at once)
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - uses: actions/checkout@v4

@@ -18,6 +18,7 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_TXN_POOL: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,7 +26,6 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python -m screener_scraper init-db
       - name: Market caps for slice ${{ matrix.shard }}/20
         run: python -m screener_scraper rank-candidates --shard ${{ matrix.shard }}/20
 
@@ -36,6 +36,7 @@ jobs:
     timeout-minutes: 15
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SUPABASE_TXN_POOL: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import functools
 import socket
 import time
@@ -70,6 +71,9 @@ def _dedupe(rows: Sequence[tuple], pk_idx: Sequence[int]) -> List[tuple]:
 class DB:
     def __init__(self, url: Optional[str] = None):
         self.url = url or config.database_url()
+        if os.environ.get("SUPABASE_TXN_POOL") == "1" and "pooler.supabase.com:5432" in self.url:
+            # many parallel runners exhaust the session pooler (EMAXCONNSESSION); transaction mode multiplexes
+            self.url = self.url.replace("pooler.supabase.com:5432", "pooler.supabase.com:6543")
         self._conn = self._connect(autocommit=False)    # data connection: one tx per company
         self._trail = self._connect(autocommit=True)    # audit connection: autocommit
         self._metric: Dict[Tuple[str, str, Optional[int]], int] = {}
