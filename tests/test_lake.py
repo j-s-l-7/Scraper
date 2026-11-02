@@ -9,7 +9,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from screener_scraper import lake  # noqa: E402
-from screener_scraper.lake_drive import due, next_window, ranks_str, week_key  # noqa: E402
+from screener_scraper.lake_drive import (due, fails_of, next_window, plan_parts, ranks_str, retry_action,  # noqa: E402
+                                         week_key)
 from screener_scraper.lake_runner import runner_ranks, window_ranks  # noqa: E402
 from screener_scraper.rank import parse_candidates  # noqa: E402
 
@@ -37,6 +38,24 @@ class WindowMath(unittest.TestCase):
         assert ranks_str([3, 1, 2]) == "1,2,3"
         assert week_key(__import__("datetime").date(2026, 11, 1)) == "2026-W44"
         assert due(None, "x") and due("a", "b") and not due("b", "b")
+
+
+class LoaderBookkeeping(unittest.TestCase):
+    def test_parts_given_up_after_two_failed_downloads(self):
+        assert fails_of("failed 2") == 2 and fails_of("loaded") == 0 and fails_of(None) == 0
+        assert fails_of("failed x") == 0 and fails_of("no_artifacts: boom") == 0
+        names = ["lake-1-1", "lake-1-2", "lake-1-3", "lake-1-4"]
+        logged = {"lake-1-1": "loaded", "lake-1-2": "failed 1", "lake-1-3": "failed 2"}
+        assert plan_parts(names, logged) == (["lake-1-2", "lake-1-4"], ["lake-1-3"])
+        assert plan_parts(names, {n: "loaded" for n in names}) == ([], [])
+        assert plan_parts([], {}) == ([], [])           # a finished run without artifacts has nothing left to load
+
+    def test_one_retry_per_window_never_while_busy(self):
+        assert retry_action([118], 1, False, False) == "dispatch"
+        assert retry_action([118], 1, False, True) == "wait"      # a newer queued run would cancel a pending one
+        assert retry_action([118], 1, True, False) == "none"      # already retried
+        assert retry_action([118], 2, False, False) == "none"     # a retry window is not retried again
+        assert retry_action([], 1, False, True) == "none"
 
 
 class Helpers(unittest.TestCase):

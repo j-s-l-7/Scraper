@@ -25,7 +25,7 @@ concurrency:
 jobs:
   lake:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 350        # hosted max is 360
     strategy:
       fail-fast: false
       matrix:
@@ -62,9 +62,11 @@ jobs:
       - name: Apply migrations to the runner-local Postgres
         run: python -m screener_scraper init-db
       - name: Slice ${{ matrix.k }}/20 of ${{ inputs.from_rank }}-${{ inputs.to_rank }}
+        # a step timeout fails the step, so the always() upload steps below still run (a job timeout may not)
+        timeout-minutes: 330
         run: |
           python -m screener_scraper lake-runner --from-rank "${{ inputs.from_rank }}" --to-rank "${{ inputs.to_rank }}" \
-            --k ${{ matrix.k }} --n 20 --ranks "${{ inputs.ranks }}" --out lake-out --max-minutes 315
+            --k ${{ matrix.k }} --n 20 --ranks "${{ inputs.ranks }}" --out lake-out --max-minutes 300
       - name: Add extracted document text to the artifact
         if: always()
         run: |

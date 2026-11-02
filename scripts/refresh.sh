@@ -18,11 +18,17 @@ LOG="logs/refresh_$(date +%F).log"
 exec >>"$LOG" 2>&1
 echo "=== refresh $(date '+%F %T') ==="
 
-# single instance (mkdir is atomic; stale after 2h)
+# Lock dirs (mkdir is atomic) hold their owner's pid and are stale only once that process is gone. The command line
+# must match too, so a pid reused after a reboot doesn't count.
+held() { local p; p=$(cat "$1/pid" 2>/dev/null) && ps -o command= -p "$p" 2>/dev/null | grep -q -- "$2"; }
+
+# single instance
 LOCK=data/.refresh.lock
 if ! mkdir "$LOCK" 2>/dev/null; then
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +120)" ]; then rm -rf "$LOCK"; mkdir "$LOCK"; else echo "busy, skip"; exit 0; fi
+  if held "$LOCK" refresh.sh; then echo "busy, skip"; exit 0; fi
+  rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
+echo $$ > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
 
 # 1. collect finished docs runs not yet collected
@@ -36,11 +42,12 @@ done
 # 1b. lake rollout driver (top 1000): load finished equity-lake runs, retry gaps once, dispatch the next window,
 #     daily top-100 sync + equity-docs, weekly equity-shards. Idempotent; never fails; logs one summary line.
 #     Detached with its own lock: artifact downloads can take hours on a slow link and must not hold up the rest.
-if mkdir data/.lake-drive.lock 2>/dev/null; then
+#     Never two at once: load_run starts by wiping the run's download dir, which would destroy the other's downloads.
+if mkdir data/.lake-drive.lock 2>/dev/null || { ! held data/.lake-drive.lock lake-drive &&
+     rm -rf data/.lake-drive.lock && mkdir data/.lake-drive.lock; }; then
   nohup bash -c "LC_ALL=en_US.UTF-8 '$PY' -m screener_scraper lake-drive; rm -rf data/.lake-drive.lock" \
     >> "logs/lake_drive_$(date +%F).log" 2>&1 &
-elif [ -n "$(find data/.lake-drive.lock -maxdepth 0 -mmin +600)" ]; then
-  rm -rf data/.lake-drive.lock      # stale (crashed run); the next cycle starts a fresh one
+  echo $! > data/.lake-drive.lock/pid
 else
   echo "lake-drive still running"
 fi

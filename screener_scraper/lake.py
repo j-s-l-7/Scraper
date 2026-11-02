@@ -189,7 +189,9 @@ def export_tables(conn, out_dir: Path, seq: int, *, company_id: Optional[int] = 
             data, n = _copy_out(cur, q + (" order by 1" if t in ("metric", "scrape_run") else ""), p)
             if n == 0:
                 continue
-            (out_dir / f"{t}.{seq:06d}.csv.gz").write_bytes(gzip.compress(data, 3))
+            tmp = out_dir / f".{t}.{seq:06d}.csv.gz.tmp"        # not matched by the loader's *.csv.gz glob
+            tmp.write_bytes(gzip.compress(data, 3))
+            tmp.replace(out_dir / f"{t}.{seq:06d}.csv.gz")      # atomic: a runner killed mid-write leaves no torn file
             counts[t] = n
     conn.rollback()
     return counts

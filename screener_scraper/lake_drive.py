@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from . import config
 from .lake import ARTIFACT_DIR, TABLES, export_tables, lake_connect, lake_up, load_export_dir
@@ -33,6 +33,7 @@ RUNNERS = 20
 BUSY = {"queued", "in_progress", "waiting", "pending", "requested"}
 DOWNLOAD_PARALLEL = 8              # artifact downloads in flight at once
 DOWNLOAD_TIMEOUT = 3 * 3600        # per artifact; ~50 MB at ~12 KB/s takes ~70 min
+MAX_PART_FAILS = 2                 # a part whose download failed this often is given up; the window retry covers it
 
 
 def repo() -> str:
@@ -64,6 +65,27 @@ def due(last: Optional[str], key: str) -> bool:
 
 def ranks_str(ranks: List[int]) -> str:
     return ",".join(str(r) for r in sorted(ranks))
+
+
+def fails_of(status: Optional[str]) -> int:
+    """lake_load_log status 'failed 2' -> 2; anything else -> 0."""
+    head, _, n = (status or "").partition(" ")
+    return int(n) if head == "failed" and n.isdigit() else 0
+
+
+def plan_parts(names: List[str], logged: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    """(still to download, given up) for a run's artifacts, from their lake_load_log statuses."""
+    open_ = [n for n in names if logged.get(n) != "loaded"]
+    gave_up = [n for n in open_ if fails_of(logged.get(n)) >= MAX_PART_FAILS]
+    return [n for n in open_ if n not in gave_up], gave_up
+
+
+def retry_action(miss: List[int], attempt: int, retried: bool, busy: bool) -> str:
+    """A loaded window's missing ranks get ONE retry window: 'dispatch' it now, 'wait' while another lake run is in
+    progress (a newer queued run would cancel a pending one), or 'none'."""
+    if not miss or attempt > 1 or retried:
+        return "none"
+    return "wait" if busy else "dispatch"
 
 
 def extra_windows(conn) -> List[Tuple[int, int]]:
@@ -123,8 +145,15 @@ def state_set(cur, key: str, value: str) -> None:
                 "set value=excluded.value, updated_at=now()", (key, value))
 
 
-def load_run(run_id: int, conn=None) -> Dict[str, int]:
-    """Download and load every lake-<run_id>-* artifact. Idempotent. Returns total rows per table."""
+class Loaded(NamedTuple):
+    rows: Dict[str, int]          # rows loaded per table by this call
+    gave_up: List[str]            # parts given up after MAX_PART_FAILS failed downloads
+    complete: bool                # the run has finished and every part is loaded or given up
+
+
+def load_run(run_id: int, conn=None) -> Loaded:
+    """Download and load every lake-<run_id>-* artifact. Idempotent: loaded parts are skipped, and the run is marked
+    __complete__ once it has finished and every part is loaded or given up."""
     from .documents import merge_tree
     own = conn is None
     conn = conn or lake_connect()
@@ -138,16 +167,21 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
         try:
             names = [n for n in gh("api", f"repos/{repo()}/actions/runs/{run_id}/artifacts", "--paginate",
                                    "--jq", ".artifacts[].name").split() if n.startswith(f"lake-{run_id}-")]
-        except Exception:
-            names = []
+        except Exception as e:          # unknown is not empty: a failed listing never completes a run
+            with conn, conn.cursor() as cur:
+                cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
+                            "values (%s,'-',0,0,%s) on conflict (run_id, artifact) do update set status=excluded.status,"
+                            " loaded_at=now()", (run_id, "no_artifacts: " + str(e)[:120]))
+            return Loaded(totals, [], False)
         with conn.cursor() as cur:
-            cur.execute("select artifact from public.lake_load_log where run_id=%s and status='loaded'", (run_id,))
-            done = {a for (a,) in cur.fetchall()}
+            cur.execute("select artifact, status from public.lake_load_log where run_id=%s", (run_id,))
+            logged = dict(cur.fetchall())
+        conn.rollback()                 # no transaction held open across hours of downloads
+        todo, _ = plan_parts(names, logged)
         # each artifact is loaded (and logged) as soon as it lands, so a slow link or a killed process keeps the
         # progress made so far; the next lake-drive skips what is already loaded. Downloads run in parallel:
         # GitHub's artifact storage serves this Mac at ~12-40 KB/s per connection, so one ~50 MB part at a time
         # never finished inside its timeout.
-        failed, err, loaded = [], "", 0
 
         def fetch(name: str) -> Tuple[bool, str]:
             try:
@@ -170,41 +204,44 @@ def load_run(run_id: int, conn=None) -> Dict[str, int]:
                             "values (%s,%s,%s,%s,'loaded') on conflict (run_id, artifact) do update set "
                             "files=excluded.files, rows_loaded=excluded.rows_loaded, status='loaded', loaded_at=now()",
                             (run_id, name, n_files, sum(rows.values())))
+            logged[name] = "loaded"
             shutil.rmtree(art, ignore_errors=True)
+
+        def fail_one(name: str, why: str) -> None:      # counted per part: MAX_PART_FAILS failures give it up
+            logged[name] = f"failed {fails_of(logged.get(name)) + 1}"
+            with conn, conn.cursor() as cur:
+                cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
+                            "values (%s,%s,0,0,%s) on conflict (run_id, artifact) do update set "
+                            "status=excluded.status, loaded_at=now()", (run_id, name, logged[name]))
+            log.warning("run %s %s: download %s: %s", run_id, name, logged[name], why[:200])
+            shutil.rmtree(dest / name, ignore_errors=True)
 
         pool = ThreadPoolExecutor(max_workers=DOWNLOAD_PARALLEL)
         try:
-            futures = {pool.submit(fetch, n): n for n in names if n not in done}
+            futures = {pool.submit(fetch, n): n for n in todo}
             for fut in as_completed(futures):   # loads stay sequential on one connection, overlapping the downloads
                 name = futures[fut]
                 ok, e = fut.result()
-                err = err or e
                 if ok:
                     load_one(name)
-                    loaded += 1
                 else:
-                    failed.append(name)
-                    shutil.rmtree(dest / name, ignore_errors=True)
+                    fail_one(name, e)
         finally:
             pool.shutdown(cancel_futures=True)
-        if not names or (failed and not loaded and not done):
-            with conn, conn.cursor() as cur:
-                cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
-                            "values (%s,'-',0,0,%s) on conflict (run_id, artifact) do update set status=excluded.status,"
-                            " loaded_at=now()", (run_id, "no_artifacts: " + err[:120]))
-            return totals
-        shutil.rmtree(dest, ignore_errors=True)
-        try:        # a run counts as fully loaded only once it has completed AND every artifact was loaded
+        todo, gave_up = plan_parts(names, logged)
+        try:        # a run counts as fully loaded only once it has completed AND no part is left to download
             st = gh("run", "view", str(run_id), "-R", repo(), "--json", "status", "--jq", ".status").strip()
         except Exception:
             st = ""
-        if st == "completed" and not failed:
+        complete = st == "completed" and not todo
+        if complete:
             with conn, conn.cursor() as cur:
                 cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
                             "values (%s,'__complete__',%s,%s,'loaded') on conflict (run_id, artifact) do update "
                             "set loaded_at=now()", (run_id, len(names), sum(totals.values())))
-        return totals
+        return Loaded(totals, gave_up, complete)
     finally:
+        shutil.rmtree(dest, ignore_errors=True)
         if own:
             conn.close()
 
@@ -251,18 +288,22 @@ def drive_once(allow_dispatch: bool = True) -> str:
             if r["status"] != "completed" or rid in loaded:
                 continue
             t0 = time.monotonic()
-            tot = load_run(rid, conn)
+            res = load_run(rid, conn)
+            line = f"loaded run {rid} ({sum(res.rows.values())} rows, {time.monotonic() - t0:.0f}s)"
+            if res.gave_up:
+                line += f" gave up on {', '.join(res.gave_up)}"
             with conn, conn.cursor() as cur:
                 cur.execute("select window_id, from_rank, to_rank, ranks, attempt from public.lake_window "
                             "where run_id=%s", (rid,))
                 w = cur.fetchone()
-            retry = ""
-            if w:
+                # a run can carry several window rows: a retry of any of them counts
+                cur.execute("select exists (select 1 from public.lake_window a join public.lake_window b "
+                            "on a.note = 'retry of window ' || b.window_id where b.run_id=%s and a.attempt=2)", (rid,))
+                retried = cur.fetchone()[0]
+            if w and res.complete:          # gaps are judged once every part is loaded or given up
                 miss = missing_ranks(conn, window_ranks_of(w))
-                with conn, conn.cursor() as cur:
-                    cur.execute("update public.lake_window set status=%s, loaded_at=now() where window_id=%s",
-                                ("loaded" if not miss or w[4] > 1 else "retried", w[0]))
-                if miss and w[4] == 1 and not busy:
+                act = retry_action(miss, w[4], retried, bool(busy))
+                if act == "dispatch":
                     new = dispatch("equity-lake.yml", {"from_rank": str(min(miss)), "to_rank": str(max(miss)),
                                                        "ranks": ranks_str(miss)})
                     with conn, conn.cursor() as cur:
@@ -270,8 +311,17 @@ def drive_once(allow_dispatch: bool = True) -> str:
                                     "values (%s,%s,%s,2,%s,%s)", (min(miss), max(miss), ranks_str(miss), new,
                                                                   f"retry of window {w[0]}"))
                     busy = [{"databaseId": new, "status": "queued"}]
-                    retry = f" retry={len(miss)} ranks"
-            summary.append(f"loaded run {rid} ({sum(tot.values())} rows, {time.monotonic() - t0:.0f}s){retry}")
+                    line += f" retry={len(miss)} ranks"
+                if act == "wait":           # re-open the run so a later drive dispatches its retry
+                    with conn, conn.cursor() as cur:
+                        cur.execute("delete from public.lake_load_log where run_id=%s and artifact='__complete__'",
+                                    (rid,))
+                    line += f" retry of {len(miss)} ranks waits for the running lake run"
+                else:
+                    with conn, conn.cursor() as cur:
+                        cur.execute("update public.lake_window set status=%s, loaded_at=now() where window_id=%s",
+                                    ("retried" if act == "dispatch" or retried else "loaded", w[0]))
+            summary.append(line)
         # 4. daily/weekly top-100 jobs
         today = date.today()
         with conn.cursor() as cur:
