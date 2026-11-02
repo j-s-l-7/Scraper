@@ -3,10 +3,24 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date
+from typing import Optional
 
 from . import config
+
+# commands that write top-100 data: skipped while Supabase is full (R8 overflow; the lake is primary then).
+# Identity and control writes (universe, rank-*, init-db, dq's growth) are KB-scale and stay allowed.
+SUPABASE_WRITERS = {"scrape", "yf", "reparse", "docs", "load-documents", "enqueue", "worker", "supervise"}
+
+
+def overflow_gate(cmd: str, db) -> Optional[str]:
+    """The db_full reason when `cmd` would write into a full Supabase; None for other commands and databases."""
+    if cmd not in SUPABASE_WRITERS or "supabase" not in db.url:
+        return None
+    from .jobs import overflow_reason
+    return overflow_reason(db.trail)
 
 
 def setup_logging() -> None:
@@ -207,6 +221,11 @@ def main(argv=None) -> int:
     from .db import DB
     db = DB()
     try:
+        why = overflow_gate(a.cmd, db)
+        if why:
+            print(("::warning::" if os.environ.get("GITHUB_ACTIONS") else "") +
+                  f"Supabase overflow ({why}): {a.cmd} skipped, the lake is primary for the top 100")
+            return 0
         if a.cmd == "init-db":
             print("applied:", ", ".join(db.init_db()))
         elif a.cmd == "universe":

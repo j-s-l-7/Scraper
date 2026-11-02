@@ -96,20 +96,30 @@ def _work(args: tuple) -> tuple:
 
 
 def catalog(symbols: list[str] | None = None) -> list[dict]:
-    """Documents with status ok, from Postgres (read-only)."""
+    """Documents with status ok, from Postgres (read-only): Supabase, or the lake's top 100 once the lake is primary for
+    them (Supabase full, R8). A lake that is down raises: falling back to Supabase then would make build() drop every
+    lake-only document."""
     import psycopg2
     import psycopg2.extras
     from screener_scraper import config
+    from screener_scraper.lake import lake_connect, lake_url, top100_on_lake
 
+    lc = lake_connect()
+    try:
+        on_lake = top100_on_lake(lc)
+    finally:
+        lc.close()
     sql = """select d.company_id, c.nse_symbol as symbol, c.name, d.doc_type, d.fiscal_year, d.period_label, d.doc_date,
                     d.url, d.text_path, d.page_count, d.char_count, d.pdf_sha256
              from equity.document d join equity.company c using (company_id)
              where d.status = 'ok' and d.text_path is not null and c.nse_symbol is not null"""
+    if on_lake:                     # the index stays the top 100's
+        sql += " and d.company_id in (select company_id from equity.universe where universe_code='TOP100_MCAP')"
     params: list = []
     if symbols:
         sql += " and c.nse_symbol = any(%s)"
         params.append(symbols)
-    con = psycopg2.connect(config.database_url(session=True), keepalives=1, keepalives_idle=30)
+    con = psycopg2.connect(lake_url() if on_lake else config.database_url(session=True), keepalives=1, keepalives_idle=30)
     try:
         con.set_session(readonly=True, autocommit=True)
         cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)

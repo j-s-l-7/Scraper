@@ -776,10 +776,11 @@ def dq_cli(which: str = "both", force: bool = False) -> int:
     from .db import DB
     results = []
     if which in ("supabase", "both"):
+        from .jobs import overflow_reason
         db = DB()
         try:
-            r = run_dq(db.trail, "supabase", None, force=force)
-            results.append(r)
+            why = overflow_reason(db.trail) if "supabase" in db.url else None   # full: write nothing more there
+            results.append({"db": "supabase", "skipped": why} if why else run_dq(db.trail, "supabase", None, force=force))
             if which == "both":
                 results.append(_lake_part(db, force))
         finally:

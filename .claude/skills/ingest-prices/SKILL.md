@@ -34,6 +34,8 @@ python3 ingestion/backfill_from_nse.py --date 2026-10-30 --all         # every E
 
 ## Automation
 `.github/workflows/daily-prices.yml` runs Mon–Fri at 17:00 IST and needs the repo secret `DATABASE_URL`.
+While Supabase is full (`control.paused`, reason `db_full`) both scripts exit 0 without writing, and top-100 prices
+come from the local fleet's `yf` role into the lake.
 To debug a red run: `gh run list -w daily-prices.yml -L 5` then `gh run view <id> --log-failed`.
 
 ## Verify

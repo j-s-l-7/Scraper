@@ -50,6 +50,41 @@ def is_paused(conn) -> bool:
     return bool(get_control(conn, "paused", False))
 
 
+def overflow_reason(conn, latch: bool = True) -> Optional[str]:
+    """R8 overflow: the db_full reason once the database reached control.storage_limit_mb, else None. The first caller
+    to see it latches control.paused; only a human clears it. A pause for any other reason is not overflow.
+    While it holds, top-100 writers skip Supabase and the lake is primary for the top 100 (lake_state top100_primary)."""
+    with conn.cursor() as cur:
+        cur.execute("select value, reason from equity.control where key='paused'")
+        r = cur.fetchone()
+    if r and r[0] and (r[1] or "").startswith("db_full"):
+        return r[1]
+    limit, size = float(get_control(conn, "storage_limit_mb", 470)), db_size_mb(conn)
+    if size < limit:
+        return None
+    why = f"db_full: {size:.0f} MB >= limit {limit:.0f} MB (R8)"
+    if latch:
+        try:
+            set_control(conn, "paused", True, why)
+        except Exception as e:          # e.g. the project already went read-only: it is still overflow
+            log.warning("could not latch control.paused: %s", e)
+    return why
+
+
+def overflow_for_url(url: Optional[str], latch: bool = True) -> Optional[str]:
+    """overflow_reason for a database URL. Only Supabase has the quota: the lake and runner-local databases carry the
+    same control rows but are never full, so they are not even connected to."""
+    if "supabase" not in (url or ""):
+        return None
+    import psycopg2
+    conn = psycopg2.connect(url, connect_timeout=20)
+    try:
+        conn.autocommit = True
+        return overflow_reason(conn, latch)
+    finally:
+        conn.close()
+
+
 # ───────── enqueue ─────────
 def enqueue(conn, batch: str, universe: str = config.UNIVERSE_CODE, kinds: Sequence[str] = KINDS,
             symbols: Optional[Sequence[str]] = None) -> int:

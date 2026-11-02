@@ -156,6 +156,14 @@ def lake_connect(autocommit: bool = False):
     return c
 
 
+def top100_on_lake(conn) -> bool:
+    """Whether the lake is primary for the top 100: lake_state 'top100_primary', set by lake-drive once Supabase is
+    full (R8). A human deletes it only after copying the top 100 back to Supabase (see the scrape-screener skill)."""
+    with conn.cursor() as cur:
+        cur.execute("select 1 from public.lake_state where key='top100_primary'")
+        return cur.fetchone() is not None
+
+
 # ───────────────────────────── export (runner side and Supabase sync) ─────────────────────────────
 def _copy_out(cur, query: str, params: tuple) -> Tuple[bytes, int]:
     buf = io.StringIO()

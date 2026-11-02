@@ -59,10 +59,11 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-load_dotenv(
+load_dotenv(                    # no override: a caller's DATABASE_URL wins
     os.path.join(os.path.dirname(__file__), "..", ".env"),
-    override=True,
+    override=False,
 )
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 log = logging.getLogger("ingest_concalls")
 
@@ -525,6 +526,11 @@ def run(symbol: str, slug: str, extra_urls: list[str] | None = None) -> int:
 
 
 def main() -> int:
+    from screener_scraper.jobs import overflow_for_url
+    why = overflow_for_url(os.getenv("DATABASE_URL"))
+    if why:
+        log.warning("Supabase overflow (%s): nothing written, the lake is primary for the top 100", why)
+        return 0
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--symbol", required=True, help="NSE symbol, e.g. TCS")
     ap.add_argument("--slug", help="screener.in slug (default: same as symbol)")

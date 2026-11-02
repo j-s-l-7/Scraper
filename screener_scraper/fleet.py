@@ -38,14 +38,20 @@ def _company_timeout(signum, frame):
     raise CompanyTimeout(f"over {COMPANY_MAX_S // 60} min (a download that never finishes)")
 
 
-def source_ranks(src: DB) -> List[Tuple[int, int, str]]:
+def source_ranks(src: DB, first: int = FIRST_RANK) -> List[Tuple[int, int, str]]:
     with src.trail.cursor() as cur:
         cur.execute("""select u.rank, c.company_id, coalesce(c.nse_symbol, c.screener_slug)
                        from equity.universe u join equity.company c using (company_id)
                        where u.universe_code=%s and u.as_of=(select max(as_of) from equity.universe
                              where universe_code=%s) and u.rank between %s and %s order by u.rank""",
-                    (TOP1000_CODE, TOP1000_CODE, FIRST_RANK, LAST_RANK))
+                    (TOP1000_CODE, TOP1000_CODE, first, LAST_RANK))
         return cur.fetchall()
+
+
+def first_rank(db: DB) -> int:
+    """1 once the lake is primary for the top 100 (Supabase full, R8): the fleet then keeps them fresh too."""
+    from .lake import top100_on_lake
+    return 1 if top100_on_lake(db.trail) else FIRST_RANK
 
 
 def select_for(role: str, ranked: List[Tuple[int, int, str]], index: int, of: int) -> List[Tuple[int, int, str]]:
@@ -91,7 +97,7 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
     from .documents import run_docs_cli
     from .pipeline import scrape_company
     from .yf import run_company as yf_company
-    ranked = source_ranks(src)
+    ranked = source_ranks(src, first_rank(db))
     seed(src, db, [r[0] for r in ranked])   # identity + universe rows so every worker can resolve companies
     mine = select_for(role, ranked, index, of)
     run_id = db.start_run(f"fleet-{role}", {"index": index, "of": of, "companies": len(mine)})

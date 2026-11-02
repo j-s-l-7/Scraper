@@ -45,9 +45,9 @@ import time
 from typing import Iterable
 from dotenv import load_dotenv
 
-load_dotenv(
+load_dotenv(                    # no override: a caller's DATABASE_URL (e.g. the lake's dq remediation) wins
     os.path.join(os.path.dirname(__file__), "..", ".env"),
-    override=True,
+    override=False,
 )
 
 import yfinance as yf
@@ -300,6 +300,11 @@ def _print_report(r: dict) -> None:
 
 
 def main(argv: list[str]) -> int:
+    from screener_scraper.jobs import overflow_for_url
+    why = overflow_for_url(os.getenv("DATABASE_URL"))
+    if why:
+        logger.warning("Supabase overflow (%s): nothing written, the lake is primary for the top 100", why)
+        return 0
     p = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--nifty50", action="store_true",

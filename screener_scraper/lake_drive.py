@@ -94,6 +94,21 @@ def gave_up_ranks(ranks: List[int], gave_up: List[str]) -> List[int]:
     return sorted({r for n in gave_up for r in runner_ranks(ranks, int(n.rsplit("-", 1)[1]), RUNNERS)})
 
 
+IDENTITY = ("company", "universe")     # all that still comes from Supabase once the lake is primary for the top 100
+
+
+def plan_top100(full: Optional[str], err: bool, primary: bool, today: date, last_sync: Optional[str],
+                last_docs: Optional[str], last_shards: Optional[str]) -> Tuple[Optional[Tuple[str, ...]], bool, bool, bool]:
+    """Step 4: (tables to sync from Supabase or None, dispatch equity-docs?, dispatch equity-shards?, make the lake
+    primary for the top 100?). `full`: Supabase's db_full reason; `err`: Supabase couldn't be checked this tick.
+    Once the lake is primary only identity rows come down (Supabase stays the ranking authority): its frozen copies
+    must never overwrite fresher lake rows. A full Supabase gets no more GitHub writers."""
+    sync = None if err or not due(last_sync, today.isoformat()) else IDENTITY if primary or full else tuple(TABLES)
+    ok = not full and not err
+    return (sync, ok and due(last_docs, today.isoformat()),
+            ok and due(last_shards, week_key(today)) and today.weekday() >= 5, bool(full) and not err)
+
+
 def retry_action(miss: List[int], attempt: int, retried: bool, busy: bool) -> str:
     """A loaded window's missing ranks get ONE retry window: 'dispatch' it now, 'wait' while another lake run is in
     progress (a newer queued run would cancel a pending one), or 'none'."""
@@ -360,29 +375,41 @@ def drive_once(allow_dispatch: bool = True) -> str:
                         cur.execute("update public.lake_window set status=%s, loaded_at=now() where window_id=%s",
                                     ("retried" if act == "dispatch" or retried else "loaded", w[0]))
             summary.append(line)
-        # 4. daily/weekly top-100 jobs
+        # 4. daily/weekly top-100 jobs; once Supabase is full (R8) the lake becomes primary for the top 100
+        from .jobs import overflow_for_url
         today = date.today()
+        try:
+            full, err = overflow_for_url(config.database_url()), False
+        except Exception as e:          # Supabase unreachable: skip its steps this tick, the lake work goes on
+            log.warning("supabase overflow check failed: %s", e)
+            full, err = None, True
         with conn.cursor() as cur:
-            last_sync, last_docs, last_shards = (state_get(cur, k) for k in
-                                                 ("top100_sync", "docs_dispatch", "shards_dispatch"))
+            last_sync, last_docs, last_shards, primary = (state_get(cur, k) for k in (
+                "top100_sync", "docs_dispatch", "shards_dispatch", "top100_primary"))
         conn.rollback()
-        if due(last_sync, today.isoformat()):
+        sync, docs, shards, set_primary = plan_top100(full, err, primary is not None, today,
+                                                      last_sync, last_docs, last_shards)
+        if set_primary and primary is None:
+            with conn, conn.cursor() as cur:
+                state_set(cur, "top100_primary", f"lake since {today.isoformat()}")
+            summary.append(f"Supabase full ({full}): the lake is now primary for the top 100")
+        if sync:
             from .db import DB
             src = DB()
             try:
-                n = sync_top100(src, conn)
+                n = sync_top100(src, conn, sync)
             finally:
                 src.close()
             with conn, conn.cursor() as cur:
                 state_set(cur, "top100_sync", today.isoformat())
-            summary.append(f"synced top100 ({n} rows)")
-        if due(last_docs, today.isoformat()):
+            summary.append(f"synced top100 ({n} rows{', identity only' if sync == IDENTITY else ''})")
+        if docs:
             if not any(r["status"] in BUSY for r in list_runs("equity-docs.yml", 5)):
                 rid = dispatch("equity-docs.yml", {"total": "10", "retry_missing": "true"})
                 with conn, conn.cursor() as cur:
                     state_set(cur, "docs_dispatch", today.isoformat())
                 summary.append(f"dispatched equity-docs run {rid}")
-        if due(last_shards, week_key(today)) and today.weekday() >= 5:      # weekend refresh of the top 100
+        if shards:                      # weekend refresh of the top 100
             if not any(r["status"] in BUSY for r in list_runs("equity-shards.yml", 5)):
                 rid = dispatch("equity-shards.yml", {"total": "10", "universe": "TOP100_MCAP"})
                 with conn, conn.cursor() as cur:
@@ -424,11 +451,11 @@ def lake_drive_cli() -> int:
 
 
 # ───────────────────────────── Supabase top-100 sync ─────────────────────────────
-def sync_top100(src, lake_conn) -> int:
-    """COPY all equity data tables out of Supabase, then load them into the lake with the same remapping."""
+def sync_top100(src, lake_conn, tables=None) -> int:
+    """COPY equity data tables (default: all) out of Supabase, then load them into the lake with the same remapping."""
     tmp = config.ROOT / "data" / "lake" / "sync"
     shutil.rmtree(tmp, ignore_errors=True)
-    counts = export_tables(src.conn, tmp / "export", 1, tables=list(TABLES))
+    counts = export_tables(src.conn, tmp / "export", 1, tables=list(tables or TABLES))
     load_export_dir(lake_conn, tmp / "export")
     shutil.rmtree(tmp, ignore_errors=True)
     return sum(counts.values())

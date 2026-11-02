@@ -9,6 +9,10 @@ Connection: `DATABASE_URL` in `.env` (Supabase session pooler, port 5432). Every
 schema **`equity`**. The `mf` schema in the same project belongs to the mutual-fund platform: do not read it,
 write it, or join to it from this repo.
 
+Ranks 101+ live in the local lake (`postgresql://localhost:5433/equity_lake`, same `equity` layout). Once Supabase is
+full (`equity.control` `paused` with reason `db_full`, or lake `public.lake_state` key `top100_primary` set), the lake
+is primary for the top 100 too: query the lake for top-100 data.
+
 ## Map
 | need | table / view | key |
 |---|---|---|

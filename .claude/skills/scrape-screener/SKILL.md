@@ -44,8 +44,12 @@ select * from equity.control;                          -- paused? reason?
 ```
 * **dead `parse`**: screener changed its markup. Open the raw file named in `scrape_task.raw_path`, fix `parse.py`,
   add a fixture test, run `reparse`, then set those jobs back to `pending`.
-* **`paused` with reason db_full**: the DB is near the free-tier cap. Free space, or upgrade Supabase and raise
-  `control.storage_limit_mb`, then set `paused=false`.
+* **`paused` with reason db_full** (R8 overflow): Supabase reached `control.storage_limit_mb`. Top-100 writers skip
+  Supabase (`overflow_gate`, `jobs.overflow_for_url`), and lake-drive sets lake `lake_state.top100_primary`: the lake
+  is primary for the top 100, the fleet covers ranks 1-1000, and only `company`/`universe` sync down from Supabase.
+  To reverse it, in this order: (1) make room or upgrade Supabase (deleting data there needs the user's explicit
+  yes); (2) copy the top 100 lake -> Supabase with `lake.export_tables` + `load_export_dir` (the natural-key remap
+  works both ways); (3) set `paused=false`; (4) delete `lake_state` key `top100_primary`.
 * **docs `no_text`**: scanned PDFs that need OCR later. They do not count as failures.
 * **Requeue a job**: `update equity.job set status='pending', attempts=0, next_run_at=now() where ...`.
 

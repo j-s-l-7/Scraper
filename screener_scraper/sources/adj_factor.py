@@ -117,7 +117,9 @@ def dq_check(db) -> dict:
 
 
 def run(db, since: Optional[date] = None, until: Optional[date] = None) -> dict:
-    synced = sync_from_supabase(db)
+    from ..lake import top100_on_lake
+    # once the lake is primary for the top 100 (Supabase full, R8) Supabase's frozen rows must not overwrite it
+    synced = {} if top100_on_lake(db.trail) else sync_from_supabase(db)
     n = compute_factors(db)
     dq = dq_check(db)
     c.set_marker(db, NAME, status="ok", run_at=datetime.now(timezone.utc).isoformat(), last_date=c.today_ist(), dq=dq)

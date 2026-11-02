@@ -158,11 +158,12 @@ class Supervisor:
 
     # ── per-tick rules ──
     def storage_guard(self) -> None:
-        limit = jobs.get_control(self.conn, "storage_limit_mb", 470)
-        size = jobs.db_size_mb(self.conn)
-        if size >= float(limit) and not jobs.is_paused(self.conn):
-            jobs.set_control(self.conn, "paused", True, f"db_full: {size:.0f} MB >= limit {limit} MB (R8)")
-            self.event(f"R8: DB size {size:.0f} MB >= {limit} MB: control.paused=true")
+        if "supabase" not in self.db.url:      # the quota is Supabase's: the lake is never full
+            return
+        was = jobs.is_paused(self.conn)
+        why = jobs.overflow_reason(self.conn)
+        if why and not was:
+            self.event(f"R8: {why}: control.paused=true, the lake is primary for the top 100")
 
     def tick(self) -> None:
         for r in jobs.reclaim_stale(self.conn, jobs.STALE_MINUTES, self.batch):
