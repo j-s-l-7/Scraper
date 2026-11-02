@@ -52,6 +52,7 @@ Writers switch to Supabase's transaction pooler (6543) automatically; read-only 
 ```bash
 scripts/install-services.sh                # LaunchAgents: com.scraper.refresh (every 15 min) + com.scraper.console
 scripts/local-fleet.sh start|stop|status   # 6 local workers, one per source host, writing to the lake
+scripts/local-fleet.sh pause|resume        # each worker stops after its current company; refresh.sh won't restart it
 ```
 `scripts/refresh.sh` runs every 15 minutes, is idempotent and logs to `logs/refresh_<date>.log`:
 1. collect finished `equity-docs` runs into `data/documents/`

@@ -1,6 +1,7 @@
 """Local fleet worker: one process per role, writing DIRECTLY to the local lake (DATABASE_URL = lake).
 Symbol lists come from Supabase TOP1000_MCAP (SOURCE_DATABASE_URL, read-only). Every pass is idempotent
-(skips work the lake already has); `scripts/local-fleet.sh` restarts a crashed process with backoff.
+(skips work the lake already has); `scripts/local-fleet.sh` restarts a crashed process with backoff, and its
+`pause` stops every worker between companies (PAUSE_FLAG) until `resume`.
 
 ONE process per source host so every site sees a single polite client:
   screener   screener.in, ranks 1000 -> 101 descending (also yields document_link)
@@ -28,6 +29,7 @@ FIRST_RANK, LAST_RANK = 101, 1000
 RESCAN_S = 600
 COMPANY_MAX_S = 40 * 60       # under the fleet watchdog's 60 min, which restarts the whole pass from rank 101
 RETRY_DAYS = 7                # fallback chain: minutes per company, ~6% recovery; weekly per company is plenty
+PAUSE_FLAG = config.ROOT / "data" / "fleet" / "paused"   # `scripts/local-fleet.sh pause|resume`
 
 
 class CompanyTimeout(BaseException):
@@ -36,6 +38,17 @@ class CompanyTimeout(BaseException):
 
 def _company_timeout(signum, frame):
     raise CompanyTimeout(f"over {COMPANY_MAX_S // 60} min (a download that never finishes)")
+
+
+def paused() -> bool:
+    return PAUSE_FLAG.exists()
+
+
+def nap(seconds: float) -> None:
+    """The sleep between passes, cut short by a pause."""
+    end = time.monotonic() + seconds
+    while not paused() and (left := end - time.monotonic()) > 0:
+        time.sleep(min(15.0, left))
 
 
 def source_ranks(src: DB, first: int = FIRST_RANK) -> List[Tuple[int, int, str]]:
@@ -104,6 +117,10 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
     st = {"done": 0, "skipped": 0, "failed": 0, "ranked": len(ranked)}
     signal.signal(signal.SIGALRM, _company_timeout)
     for rank, cid, sym in mine:
+        if paused():                         # between companies, never inside one
+            st["paused"] = True
+            log.info("[%s] paused before rank %d %s", role, rank, sym)
+            break
         signal.alarm(COMPANY_MAX_S)          # a stuck socket read fails this company instead of hanging the pass
         try:
             if role == "screener":
@@ -134,7 +151,7 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
             log.warning("[%s] rank %d %s failed: %s: %s", role, rank, sym, type(e).__name__, str(e)[:200])
         finally:
             signal.alarm(0)
-    db.finish_run(run_id, "partial" if st["failed"] else "success", st)
+    db.finish_run(run_id, "partial" if st["failed"] or st.get("paused") else "success", st)
     return st
 
 
@@ -145,7 +162,7 @@ def run_fleet_worker(role: str, index: int, of: int, once: bool = False) -> int:
     src_url = os.environ.get("SOURCE_DATABASE_URL")
     if not src_url:
         raise SystemExit("SOURCE_DATABASE_URL (Supabase, read-only) is required")
-    while True:
+    while not paused():
         db = DB()                              # DATABASE_URL = lake
         src = DB(src_url)
         try:
@@ -157,4 +174,6 @@ def run_fleet_worker(role: str, index: int, of: int, once: bool = False) -> int:
         if once:
             return 0
         # docs roles rescan every 10 min (new document_link rows appear as scrapes land); others every 30 min
-        time.sleep(120 if not st.get("ranked") else 1800 if role in ("screener", "yf") else RESCAN_S)
+        nap(120 if not st.get("ranked") else 1800 if role in ("screener", "yf") else RESCAN_S)
+    log.info("[%s] paused: exiting until scripts/local-fleet.sh resume", role)
+    return 0
