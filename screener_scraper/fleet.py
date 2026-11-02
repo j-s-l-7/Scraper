@@ -162,7 +162,8 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
     seed_if_changed(src, db, ranked)        # identity + universe rows so every worker can resolve companies
     mine = select_for(role, ranked, index, of)
     run_id = db.start_run(f"fleet-{role}", {"index": index, "of": of, "companies": len(mine)})
-    st = {"done": 0, "skipped": 0, "failed": 0, "ranked": len(ranked)}
+    # failed counts companies whose processing raised; doc_errors the document exceptions inside done companies
+    st = {"done": 0, "skipped": 0, "failed": 0, "doc_errors": 0, "ranked": len(ranked)}
     signal.signal(signal.SIGALRM, _company_timeout)
     for rank, cid, sym in mine:
         if paused():                         # between companies, never inside one
@@ -187,9 +188,15 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
                     st["skipped"] += 1
                     continue
                 hosts = {"bse": {"bse"}, "nse": {"nse", "other"}}.get(role)
-                run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, False, False, hosts)
-                if role == "concalls" and retry_due(db, cid, kinds):   # fallback chain for docs still missing
-                    run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, True, False, None)
+                dt: dict = {}                  # this company's document counters, recorded into the pass's run
+                try:
+                    run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, False, False, hosts,
+                                 run_id=run_id, totals=dt)
+                    if role == "concalls" and retry_due(db, cid, kinds):   # fallback chain for docs still missing
+                        run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, True, False, None,
+                                     run_id=run_id, totals=dt)
+                finally:
+                    st["doc_errors"] += dt.get("doc_errors", 0)
             st["done"] += 1
             log.info("[%s] rank %d %s ok", role, rank, sym)
         except BaseException as e:           # one company never stops the pass (SystemExit, CompanyTimeout included)
@@ -199,7 +206,7 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
             log.warning("[%s] rank %d %s failed: %s: %s", role, rank, sym, type(e).__name__, str(e)[:200])
         finally:
             signal.alarm(0)
-    db.finish_run(run_id, "partial" if st["failed"] or st.get("paused") else "success", st)
+    db.finish_run(run_id, "partial" if st["failed"] or st["doc_errors"] or st.get("paused") else "success", st)
     return st
 
 

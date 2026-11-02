@@ -749,9 +749,12 @@ def _has_links(db, company_id: int, doc_type: str) -> bool:
 
 
 def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool = False, limit: Optional[int] = None,
-                 universe: str = config.UNIVERSE_CODE, shard=None, slots: int = 1, retry_missing: bool = False, discover: bool = False, hosts: Optional[set] = None) -> int:
+                 universe: str = config.UNIVERSE_CODE, shard=None, slots: int = 1, retry_missing: bool = False, discover: bool = False, hosts: Optional[set] = None,
+                 run_id: Optional[int] = None, totals: Optional[dict] = None) -> int:
     """`docs`: run the documents pipeline directly (no queue) for --symbols or a universe shard, with `slots`
-    threads. Companies without document_link rows yet are skipped (a later run picks them up). Idempotent."""
+    threads. Companies without document_link rows yet are skipped (a later run picks them up). Idempotent.
+    run_id: record into the caller's scrape_run (a fleet pass) instead of starting one per call; totals: the caller's
+    counters, incremented by this call's numeric ones (doc_errors = every document exception logged here)."""
     from concurrent.futures import ThreadPoolExecutor
     from .db import DB
     from .pipeline import shard_items, shard_ranked
@@ -769,8 +772,11 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
             companies.append(r)
     else:
         companies = [(r[1], r[2]) for r in shard_ranked(db.universe_companies(universe), shard)]
-    run_id = db.start_run("docs", {"symbols": symbols, "universe": universe, "kinds": kinds, "force": force,
-                                   "limit": limit, "slots": slots, "shard": f"{shard[0]}/{shard[1]}" if shard else None})
+    own_run = run_id is None
+    if own_run:
+        run_id = db.start_run("docs", {"symbols": symbols, "universe": universe, "kinds": kinds, "force": force,
+                                       "limit": limit, "slots": slots,
+                                       "shard": f"{shard[0]}/{shard[1]}" if shard else None})
     lock = threading.Lock()
     all_docs: Dict[str, list] = {}
     tot = {"failures": 0, "no_links": 0, "companies": len(companies)}
@@ -806,6 +812,7 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
                 except Exception as e:
                     with lock:
                         tot["failures"] += 1
+                        tot["doc_errors"] = tot.get("doc_errors", 0) + 1
                     log.error("%s discover: %s: %s", sym, type(e).__name__, e)
                     continue
                 with lock:
@@ -819,7 +826,7 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
                     st = retry_company(d, cid, run_id, kind, po, force=force)
                 except Exception as e:
                     with lock:
-                        tot["doc_errors"] = tot.get("doc_errors", 0) + (not isinstance(e, psycopg2.Error))
+                        tot["doc_errors"] = tot.get("doc_errors", 0) + 1
                         tot["failures"] += isinstance(e, psycopg2.Error)
                     log.error("%s %s retry-missing: %s: %s", sym, kind, type(e).__name__, e)
                     continue
@@ -870,7 +877,12 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
     if retry_missing:
         tot["by_source"] = recovered
         print(f"== retry-missing: tried {tot.get('tried', 0)}, recovered {tot.get('recovered', 0)} by source {recovered}")
-    db.finish_run(run_id, "partial" if tot["failures"] else "success", tot)
+    if own_run:
+        db.finish_run(run_id, "partial" if tot["failures"] else "success", tot)
+    if totals is not None:
+        for k, v in tot.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                totals[k] = totals.get(k, 0) + v
     print(f"== {len(companies)} companies, {tot['no_links']} kind-runs skipped for no links, "
           f"{tot['failures']} failures")
     return 1 if tot["failures"] else 0
