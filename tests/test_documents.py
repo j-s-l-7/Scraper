@@ -198,3 +198,21 @@ def test_paginate():
 
 def test_ppt_kind():
     assert docs.KIND_ALIASES["concall_ppt"] == "docs_ppt" and docs.DOC_TYPE_OF["docs_ppt"] == "concall_ppt"
+
+
+def test_collect_a_run_that_uploaded_nothing(monkeypatch, tmp_path):
+    """An equity-docs run whose shards found nothing new uploads no artifact: that is collected, not an error."""
+    import subprocess
+    from types import SimpleNamespace
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stdout="", stderr="no valid artifacts found to download")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(docs, "verify_documents", lambda db: {"ok_files": 0})
+    out = docs.collect_documents(None, "41501861142", "o/r", dest=tmp_path)
+    assert out["merged"] == 0 and calls
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="HTTP 401"))
+    with pytest.raises(RuntimeError):
+        docs.collect_documents(None, "1", "o/r", dest=tmp_path)

@@ -869,8 +869,9 @@ def collect_documents(db, run_id: str, repo: Optional[str] = None, dest: Optiona
     with tempfile.TemporaryDirectory(prefix="docs-collect-") as tmp:
         r = subprocess.run(["gh", "run", "download", str(run_id), "-R", repo, "-D", tmp, "-p", "documents-shard-*"],
                            capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"gh run download failed: {(r.stderr or r.stdout).strip()[:300]}")
+        err = (r.stderr or r.stdout).strip()
+        if r.returncode != 0 and "no valid artifacts" not in err:   # shards that fetched nothing upload nothing
+            raise RuntimeError(f"gh run download failed: {err[:300]}")
         merged, skipped = merge_tree(Path(tmp), dest)
     out = verify_documents(db)
     out.update({"merged": merged, "skipped_existing": skipped})
