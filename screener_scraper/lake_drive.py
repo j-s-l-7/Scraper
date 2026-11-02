@@ -3,7 +3,8 @@
   1. secrets present?  (else log "waiting for secrets" and stop)
   2. lake-up (start the local lake PG if down)
   3. load every completed-but-unloaded equity-lake run; re-dispatch missing ranks once as a smaller window
-  4. daily: sync Supabase top-100 -> lake;  daily: equity-docs (retry-missing);  weekly: equity-shards
+  4. daily: sync Supabase top-100 -> lake;  daily: equity-docs (primary fetch; retry-missing at most weekly);
+     weekly: equity-shards
   5. if no equity-lake run is in progress: dispatch the next window (101-400, 401-700, 701-1000)
 Progress is tracked in the lake tables lake_window / lake_load_log / lake_state.
 """
@@ -35,6 +36,8 @@ DOWNLOAD_PARALLEL = 8              # artifact downloads in flight at once
 DOWNLOAD_TIMEOUT = 3 * 3600        # per artifact; ~50 MB at ~12 KB/s takes ~70 min
 MAX_PART_FAILS = 6                 # a part that failed this often is given up; the window retry covers its ranks
 PART_BACKOFF_S = 900               # after n failures a part waits 15m, 30m, 1h, 2h, 4h: giving up needs >= 7.75h
+DOCS_SHARDS = 10                   # equity-docs.yml matrix size
+DOCS_RETRY_DAYS = 7                # equity-docs runs the fallback chain (retry_missing) at most this often
 
 
 def repo() -> str:
@@ -107,6 +110,14 @@ def plan_top100(full: Optional[str], err: bool, primary: bool, today: date, last
     ok = not full and not err
     return (sync, ok and due(last_docs, today.isoformat()),
             ok and due(last_shards, week_key(today)) and today.weekday() >= 5, bool(full) and not err)
+
+
+def docs_inputs(today: date, last_retry: Optional[str]) -> Dict[str, str]:
+    """Inputs of the daily equity-docs dispatch. retry_missing makes the run skip the primary fetch, so it runs at most
+    every DOCS_RETRY_DAYS; the other days fetch new links, pending documents and failed ones past their cooldown.
+    (Dispatched retry_missing every day, it left 3,127 top-100 presentations never fetched.)"""
+    retry = last_retry is None or (today - date.fromisoformat(last_retry[:10])).days >= DOCS_RETRY_DAYS
+    return {"total": str(DOCS_SHARDS), "retry_missing": "true" if retry else "false"}
 
 
 def retry_action(miss: List[int], attempt: int, retried: bool, busy: bool) -> str:
@@ -384,8 +395,8 @@ def drive_once(allow_dispatch: bool = True) -> str:
             log.warning("supabase overflow check failed: %s", e)
             full, err = None, True
         with conn.cursor() as cur:
-            last_sync, last_docs, last_shards, primary = (state_get(cur, k) for k in (
-                "top100_sync", "docs_dispatch", "shards_dispatch", "top100_primary"))
+            last_sync, last_docs, last_shards, primary, last_retry = (state_get(cur, k) for k in (
+                "top100_sync", "docs_dispatch", "shards_dispatch", "top100_primary", "docs_retry_dispatch"))
         conn.rollback()
         sync, docs, shards, set_primary = plan_top100(full, err, primary is not None, today,
                                                       last_sync, last_docs, last_shards)
@@ -405,10 +416,15 @@ def drive_once(allow_dispatch: bool = True) -> str:
             summary.append(f"synced top100 ({n} rows{', identity only' if sync == IDENTITY else ''})")
         if docs:
             if not any(r["status"] in BUSY for r in list_runs("equity-docs.yml", 5)):
-                rid = dispatch("equity-docs.yml", {"total": "10", "retry_missing": "true"})
+                # every dispatch before docs_retry_dispatch existed was a retry_missing one
+                inputs = docs_inputs(today, last_retry or last_docs)
+                retry = inputs["retry_missing"] == "true"
+                rid = dispatch("equity-docs.yml", inputs)
                 with conn, conn.cursor() as cur:
                     state_set(cur, "docs_dispatch", today.isoformat())
-                summary.append(f"dispatched equity-docs run {rid}")
+                    if retry:
+                        state_set(cur, "docs_retry_dispatch", today.isoformat())
+                summary.append(f"dispatched equity-docs run {rid} ({'retry-missing' if retry else 'primary fetch'})")
         if shards:                      # weekend refresh of the top 100
             if not any(r["status"] in BUSY for r in list_runs("equity-shards.yml", 5)):
                 rid = dispatch("equity-shards.yml", {"total": "10", "universe": "TOP100_MCAP"})

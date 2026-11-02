@@ -40,6 +40,24 @@ class WindowMath(unittest.TestCase):
         assert week_key(__import__("datetime").date(2026, 11, 1)) == "2026-W44"
         assert due(None, "x") and due("a", "b") and not due("b", "b")
 
+    def test_equity_docs_fetches_most_days_and_retries_missing_weekly(self):
+        """retry_missing skips the primary fetch: dispatched daily, it left 3,127 top-100 presentations unfetched."""
+        from datetime import date
+        d = date(2026, 11, 4)
+        assert LD.docs_inputs(d, "2026-11-03") == {"total": "10", "retry_missing": "false"}
+        assert LD.docs_inputs(d, "2026-10-29")["retry_missing"] == "false"          # 6 days after the last retry
+        assert LD.docs_inputs(d, "2026-10-28")["retry_missing"] == "true"           # 7 days
+        assert LD.docs_inputs(d, None)["retry_missing"] == "true"
+
+    def test_equity_docs_total_matches_its_matrix(self):
+        import re
+        y = (ROOT / ".github" / "workflows" / "equity-docs.yml").read_text()
+        n = len(re.search(r"shard: \[([\d, ]+)\]", y).group(1).split(","))
+        default = re.search(r"total:\n(?:\s+description:.*\n)?\s+default: \"(\d+)\"", y).group(1)
+        fallbacks = re.findall(r"inputs\.total \|\| '(\d+)'", y)
+        assert n == 10 and default == str(n) and fallbacks and set(fallbacks) == {str(n)}   # shard n+1 never ran
+        assert LD.docs_inputs(__import__("datetime").date(2026, 11, 4), None)["total"] == str(n)
+
 
 class LoaderBookkeeping(unittest.TestCase):
     def test_parts_given_up_after_max_failures(self):

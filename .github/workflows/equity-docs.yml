@@ -5,9 +5,9 @@ on:
     inputs:
       total:
         description: "Total number of shards the universe is split into (the matrix runs shards 1..10)"
-        default: "11"
+        default: "10"
       retry_missing:
-        description: "also retry missing/failed documents through the wayback / company-site fallback chain"
+        description: "retry missing/failed documents through the wayback / company-site fallback chain instead of the primary fetch"
         default: "false"
 
 concurrency:
@@ -34,9 +34,9 @@ jobs:
       - name: OCR + audio tools
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr ffmpeg
       - run: pip install -r requirements.txt
-      - name: Documents shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }}
+      - name: Documents shard ${{ matrix.shard }}/${{ github.event.inputs.total || '10' }}
         run: |
-          python -m screener_scraper docs --universe TOP100_MCAP --shard ${{ matrix.shard }}/${{ github.event.inputs.total || '11' }} --slots 4 --kinds annual_report,concall_transcript,concall_ppt ${{ github.event.inputs.retry_missing == 'true' && '--retry-missing' || '' }}
+          python -m screener_scraper docs --universe TOP100_MCAP --shard ${{ matrix.shard }}/${{ github.event.inputs.total || '10' }} --slots 4 --kinds annual_report,concall_transcript,concall_ppt ${{ github.event.inputs.retry_missing == 'true' && '--retry-missing' || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
