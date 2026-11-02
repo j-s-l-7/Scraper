@@ -211,8 +211,12 @@ def ensure_companies(db) -> int:
     db.conn.commit()
     if n:
         return n
+    url = config.supabase_url(session=True)
+    if not url:
+        log.warning("ensure_companies: the lake has no company rows and there is no Supabase url to copy them from")
+        return 0
     import psycopg2
-    src = psycopg2.connect(config.database_url(session=True), connect_timeout=20)
+    src = psycopg2.connect(url, connect_timeout=20)
     src.set_session(readonly=True, autocommit=True)
     with src.cursor() as c:
         c.execute("select * from equity.company")

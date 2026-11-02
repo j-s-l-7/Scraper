@@ -35,10 +35,15 @@ def factor_for(kind: str, value: Optional[float], prev_close: Optional[float] = 
     return None
 
 
-def sync_from_supabase(db) -> Dict[str, int]:
-    """Read-only copy of corporate_action and historical_prices (>= 2019-09-01) for companies in the lake."""
+def sync_from_supabase(db) -> dict:
+    """Read-only copy of corporate_action and historical_prices (>= 2019-09-01) for companies in the lake. Skipped
+    (logged) when this process has no Supabase url: config.supabase_url never hands back the lake itself."""
+    url = config.supabase_url(session=True)
+    if not url:
+        log.warning("adj_factor: no Supabase url (SOURCE_DATABASE_URL unset and DATABASE_URL is the lake): sync skipped")
+        return {"skipped": "no Supabase url"}
     c.ensure_companies(db)
-    src = psycopg2.connect(config.database_url(session=True), connect_timeout=20)
+    src = psycopg2.connect(url, connect_timeout=20)
     src.set_session(readonly=True, autocommit=True)
     out = {}
     with src.cursor() as cur:

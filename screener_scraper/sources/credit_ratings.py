@@ -1,4 +1,4 @@
-"""5. Credit ratings: document_link rows (doc_type credit_rating, read-only from Supabase) -> public rationale page/PDF
+"""5. Credit ratings: document_link rows (doc_type credit_rating, from the lake) -> public rationale page/PDF
 -> text via documents.py extractors (data/documents/<SYM>/credit_rating/) -> equity.credit_rating (best-effort regex)."""
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import logging
 import re
 from datetime import date, datetime, timezone
 from typing import List, Optional
-
-import psycopg2
 
 from .. import config, documents as docs
 from . import _common as c
@@ -117,14 +115,15 @@ def read_text(rel_path: str) -> str:
         return "\n".join(json.loads(l)["text"] for l in f)
 
 
-def source_links():
-    src = psycopg2.connect(config.database_url(session=True), connect_timeout=20)
-    src.set_session(readonly=True, autocommit=True)
-    with src.cursor() as cur:
+def source_links(db):
+    """credit_rating links from the lake being loaded. It holds Supabase's top 100 (lake-drive syncs document_link
+    daily) plus the fleet's ranks 101+: 8,238 links for 1,499 companies against Supabase's 526 for 91 (3 Nov 2026).
+    Reading Supabase here would drop most of them; under the fleet it read the lake anyway (DATABASE_URL)."""
+    with db.conn.cursor() as cur:
         cur.execute("select company_id, url, period_label, source from equity.document_link where doc_type='credit_rating' "
                     "order by company_id, url")
         rows = cur.fetchall()
-    src.close()
+    db.conn.commit()
     return rows
 
 
@@ -134,7 +133,7 @@ def run(db, since: Optional[date] = None, until: Optional[date] = None) -> dict:
     if m.get("blocked_on") == today.isoformat():
         return {"status": "blocked", "rows": 0}
     c.ensure_companies(db)
-    links = source_links()
+    links = source_links(db)
     with db.conn.cursor() as cur:
         cur.execute("select company_id, nse_symbol from equity.company")
         sym = dict(cur.fetchall())

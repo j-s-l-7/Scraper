@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT / "data" / "raw"
@@ -62,6 +63,10 @@ def database_url(session: bool = False) -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL not set (see .env)")
+    return _pooler(url, session)
+
+
+def _pooler(url: str, session: bool) -> str:
     # Supabase's session pooler (5432) caps at 15 clients; 20 CI runners plus the local workers,
     # console and checks exceed it. The transaction pooler (6543) is sized for many short clients
     # and works with everything here (no session state, LISTEN or server-side prepared statements).
@@ -69,6 +74,19 @@ def database_url(session: bool = False) -> str:
     if not session and os.environ.get("DB_SESSION_POOLER") != "1" and "pooler.supabase.com:5432" in url:
         url = url.replace("pooler.supabase.com:5432", "pooler.supabase.com:6543")
     return url
+
+
+def supabase_url(session: bool = False) -> Optional[str]:
+    """Supabase (the top-100 store) for code that reads it while writing the lake; None when this process has none.
+    SOURCE_DATABASE_URL first: fleet processes run with DATABASE_URL = the lake and SOURCE_DATABASE_URL = Supabase.
+    Else DATABASE_URL (a shell with .env), but never the lake itself: that "sync" copied the lake onto itself."""
+    load_env()
+    from .lake import DEFAULT_LAKE_URL             # lazy: lake imports config
+    lakes = {u.rstrip("/") for u in (os.environ.get("LAKE_DATABASE_URL"), DEFAULT_LAKE_URL) if u}
+    url = os.environ.get("SOURCE_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not url or url.rstrip("/") in lakes:
+        return None
+    return _pooler(url, session)
 
 
 def _apply_env() -> None:

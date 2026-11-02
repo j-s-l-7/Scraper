@@ -205,3 +205,58 @@ class TestSecondWave(unittest.TestCase):
         self.assertEqual((rows[1][4], rows[1][6], rows[1][8]), (7, 250000.0, 12.1))
         self.assertEqual(a.month_from_text("Portfolio_October_2026.xlsx"), date(2026, 10, 31))
         self.assertIsNone(a.match_header(["a", "b"]))
+
+
+class TestSupabaseUrl(unittest.TestCase):
+    """Fleet processes run with DATABASE_URL = the lake and SOURCE_DATABASE_URL = Supabase: a "sync from Supabase" that
+    used config.database_url() copied the lake onto itself (adj_factor: 2.07M historical_prices rows a day)."""
+    LAKE = "postgresql://localhost:5433/equity_lake"
+    SUPA = "postgresql://u:p@aws-0-x.pooler.supabase.com:5432/postgres"      # fake
+
+    def env(self, **kv):
+        for p in (mock.patch.dict("os.environ", kv, clear=True), mock.patch("screener_scraper.config.load_env")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_source_url_first_and_never_the_lake(self):
+        from screener_scraper import config
+        self.env(DATABASE_URL=self.LAKE, LAKE_DATABASE_URL=self.LAKE, SOURCE_DATABASE_URL=self.SUPA)    # the fleet
+        self.assertEqual(config.supabase_url(session=True), self.SUPA)
+        self.assertIn(":6543/", config.supabase_url())                   # transaction pooler, as database_url()
+        self.env(DATABASE_URL=self.LAKE, LAKE_DATABASE_URL=self.LAKE)
+        self.assertIsNone(config.supabase_url(session=True))
+        self.env(DATABASE_URL="postgresql://localhost:5433/equity_lake")  # the default lake url, no LAKE_DATABASE_URL
+        self.assertIsNone(config.supabase_url(session=True))
+        self.env(DATABASE_URL=self.SUPA, LAKE_DATABASE_URL=self.LAKE)     # a shell with .env: DATABASE_URL is Supabase
+        self.assertEqual(config.supabase_url(session=True), self.SUPA)
+
+    def test_adj_factor_sync_reads_supabase_or_skips(self):
+        from screener_scraper.sources import adj_factor
+        db = mock.MagicMock()
+        self.env(DATABASE_URL=self.LAKE, LAKE_DATABASE_URL=self.LAKE)
+        with mock.patch.object(adj_factor.psycopg2, "connect") as connect:
+            out = adj_factor.sync_from_supabase(db)
+        connect.assert_not_called()
+        self.assertIn("skipped", out)
+        self.env(DATABASE_URL=self.LAKE, LAKE_DATABASE_URL=self.LAKE, SOURCE_DATABASE_URL=self.SUPA)
+        db.conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (2618,)     # the lake has companies
+        with mock.patch.object(adj_factor.psycopg2, "connect", side_effect=RuntimeError("stop")) as connect:
+            with self.assertRaises(RuntimeError):
+                adj_factor.sync_from_supabase(db)
+        self.assertEqual(connect.call_args[0][0], self.SUPA)
+
+    def test_ensure_companies_without_supabase_skips(self):
+        db = mock.MagicMock()
+        db.conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (0,)         # an empty lake
+        self.env(DATABASE_URL=self.LAKE, LAKE_DATABASE_URL=self.LAKE)
+        with mock.patch("psycopg2.connect") as connect:
+            self.assertEqual(c.ensure_companies(db), 0)
+        connect.assert_not_called()
+
+    def test_credit_rating_links_come_from_the_lake_being_loaded(self):
+        db = mock.MagicMock()
+        rows = [(1, "https://www.crisil.com/r.html", "19 Aug from crisil", "other")]
+        db.conn.cursor.return_value.__enter__.return_value.fetchall.return_value = rows
+        with mock.patch("psycopg2.connect") as connect:
+            self.assertEqual(credit_ratings.source_links(db), rows)
+        connect.assert_not_called()
