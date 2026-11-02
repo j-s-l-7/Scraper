@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 from . import config
 from .db import DB
+from .fallback import RETRY_BACKOFF_DAYS
 from .lake_runner import seed
 from .rank import TOP1000_CODE
 
@@ -30,7 +31,6 @@ YF_LAST_RANK = 1000           # yf refetches each company's full price history; 
 SCREENER_FRESH_DAYS = 7       # one IP at ~106 s a company: a daily refresh of ~1,800 companies never finishes
 RESCAN_S = 600
 COMPANY_MAX_S = 40 * 60       # under the fleet watchdog's 60 min, which restarts the whole pass from rank 101
-RETRY_DAYS = 7                # fallback chain: minutes per company, ~6% recovery; weekly per company is plenty
 PAUSE_FLAG = config.ROOT / "data" / "fleet" / "paused"   # `scripts/local-fleet.sh pause|resume`
 
 
@@ -97,14 +97,18 @@ def has_links(db: DB, company_id: int, doc_types: List[str]) -> bool:
 
 
 def retry_due(db: DB, company_id: int, doc_types: List[str]) -> bool:
-    """A missing/failed/no_text document whose fallback chain last ran over RETRY_DAYS ago, or never
-    (attempts_log entries are written only by fallback.retry_company, each stamped `at`)."""
+    """A missing/failed/no_text document whose fallback chain is due: fallback.chain_due in SQL. A chain run stamps all
+    its attempts_log entries with one `at`; after n runs the next waits RETRY_BACKOFF_DAYS[min(n, 4) - 1] days
+    (7, 14, 28, 56). 'primary' entries are the normal download's cooldown stamp (documents.py), not chain runs."""
     with db.trail.cursor() as cur:
-        cur.execute("""select exists (select 1 from equity.document d where d.company_id=%s and d.doc_type = any(%s)
-                         and d.status in ('missing','failed','no_text')
-                         and coalesce((select max((e->>'at')::timestamptz) from jsonb_array_elements(d.attempts_log) e),
-                                      '-infinity') < now() - make_interval(days => %s))""",
-                    (company_id, doc_types, RETRY_DAYS))
+        cur.execute("""select exists (select 1 from equity.document d
+                         cross join lateral (select count(distinct e->>'at') as runs, max((e->>'at')::timestamptz) as last_at
+                                             from jsonb_array_elements(d.attempts_log) e
+                                             where e->>'at' is not null and e->>'source' is distinct from 'primary') a
+                         where d.company_id=%s and d.doc_type = any(%s) and d.status in ('missing','failed','no_text')
+                           and (a.runs = 0 or a.last_at <= now() - make_interval(
+                                days => (%s::int[])[least(a.runs, %s)::int])))""",
+                    (company_id, doc_types, RETRY_BACKOFF_DAYS, len(RETRY_BACKOFF_DAYS)))
         return cur.fetchone()[0]
 
 

@@ -816,7 +816,7 @@ def run_docs_cli(db, symbols: Optional[List[str]], kinds: List[str], force: bool
             if retry_missing:
                 from .fallback import retry_company
                 try:
-                    st = retry_company(d, cid, run_id, kind, po)
+                    st = retry_company(d, cid, run_id, kind, po, force=force)
                 except Exception as e:
                     with lock:
                         tot["doc_errors"] = tot.get("doc_errors", 0) + (not isinstance(e, psycopg2.Error))

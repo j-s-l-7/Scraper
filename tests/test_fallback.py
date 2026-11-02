@@ -165,3 +165,124 @@ def test_listing_links():
     assert F.is_listing_link("https://a.com/ir/transcripts?year=2021", "2021", cur)
     assert F.is_listing_link("https://a.com/ir/transcripts?page=2", "Next", cur)
     assert not F.is_listing_link("https://a.com/about", "About us", cur)
+
+
+# ───────── chain efficiency: collinfo once per process, per-document backoff 7 / 14 / 28 / 56 days ─────────
+import json  # noqa: E402
+import time  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+NOW = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+
+
+def _runs(*days_ago, source="wayback"):
+    """attempts_log of one chain run per `days_ago`: every entry of a run carries the same `at`."""
+    out = []
+    for d in days_ago:
+        at = (NOW - timedelta(days=d)).isoformat(timespec="seconds")
+        out += [{"source": source, "url": "available", "result": "no snapshot", "at": at},
+                {"source": "company_site", "url": None, "result": "no matching pdf", "at": at}]
+    return out
+
+
+def test_chain_backs_off_per_document():
+    assert F.chain_due([], NOW) and F.chain_due(None, NOW)                       # never tried
+    assert F.chain_runs(_runs(10, 3)) == (2, NOW - timedelta(days=3))
+    assert not F.chain_due(_runs(6), NOW) and F.chain_due(_runs(7), NOW)                       # 1 run: 7 days
+    assert not F.chain_due(_runs(40, 13), NOW) and F.chain_due(_runs(40, 14), NOW)             # 2 runs: 14
+    assert not F.chain_due(_runs(90, 60, 27), NOW) and F.chain_due(_runs(90, 60, 28), NOW)     # 3 runs: 28
+    assert not F.chain_due(_runs(400, 300, 200, 55), NOW) and F.chain_due(_runs(500, 400, 300, 200, 56), NOW)
+    # the normal download's cooldown stamp (documents.py, source 'primary') is not a chain run
+    assert F.chain_runs([{"source": "primary", "url": "u", "result": "HTTP 503", "at": NOW.isoformat()}]) == (0, None)
+
+
+class _Cur:
+    def __init__(self, db):
+        self.db, self.rows = db, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=()):
+        self.db.sql.append((sql, params))
+        self.rows = next((list(v) for k, v in self.db.answers.items() if k in sql), [])
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _DB:
+    def __init__(self, todo):
+        self.answers = {"website from equity.company": [("AAA", "https://aaa.example")],
+                        "attempts_log from equity.document": todo}
+        self.sql = []
+        self.trail = self
+
+    def cursor(self):
+        return _Cur(self)
+
+    def appended(self):
+        """{url: entries appended to its attempts_log}"""
+        return {p[-1]: json.loads(p[-4]) for s, p in self.sql if s.lstrip().startswith("update") and "attempts_log" in s}
+
+
+def test_retry_company_runs_only_documents_that_are_due(monkeypatch):
+    def nothing(po, url, log_):
+        log_.append({"source": "wayback", "url": url, "result": "no snapshot"})
+    monkeypatch.setattr(F, "wayback_fetch", nothing)
+    monkeypatch.setattr(F, "commoncrawl_fetch", lambda po, url, log_: log_.append(
+        {"source": "commoncrawl", "url": url, "result": "no capture"}))
+    monkeypatch.setattr(F, "cached_crawl", lambda *a: [])
+    now = datetime.now(timezone.utc)
+
+    def log_days_ago(d):
+        return [{"source": "wayback", "url": "available", "result": "x",
+                 "at": (now - timedelta(days=d)).isoformat(timespec="seconds")}]
+    todo = [("https://a/new.pdf", "Annual Report 2020", 2020, None, "missing", []),            # never tried: due
+            ("https://a/recent.pdf", "Annual Report 2019", 2019, None, "missing", log_days_ago(2)),   # not due
+            ("https://a/old.pdf", "Annual Report 2018", 2018, None, "missing", log_days_ago(30))]    # due
+    db = _DB(todo)
+    st = F.retry_company(db, 1, 9, "docs_ar", po=object())
+    assert st["tried"] == 2 and st["not_due"] == 1 and st["still_missing"] == 2
+    got = db.appended()
+    assert set(got) == {"https://a/new.pdf", "https://a/old.pdf"}
+    assert all(len({e["at"] for e in entries}) == 1 for entries in got.values())     # one stamp per run
+    db = _DB(todo)
+    assert F.retry_company(db, 1, 9, "docs_ar", po=object(), force=True)["tried"] == 3
+
+
+class _CCPo:
+    def __init__(self, status=200):
+        self.status, self.calls = status, []
+
+    def get(self, url, **kw):
+        self.calls.append(url)
+        if url.endswith("collinfo.json"):
+            return self.status, json.dumps([{"id": "CC-MAIN-2025-05"}]).encode(), "application/json"
+        return 404, b"", "text/plain"
+
+
+def test_collinfo_is_fetched_once_per_process(monkeypatch):
+    monkeypatch.setattr(F, "_cc_ids", None)
+    po = _CCPo()
+    for u in ("https://a/1.pdf", "https://a/2.pdf", "https://a/3.pdf"):
+        assert F.commoncrawl_fetch(po, u, []) is None
+    assert sum(c.endswith("collinfo.json") for c in po.calls) == 1 and len(po.calls) == 4
+
+
+def test_a_failed_collinfo_is_not_refetched_for_every_document(monkeypatch):
+    monkeypatch.setattr(F, "_cc_ids", None)
+    po = _CCPo(status=503)
+    log_: list = []
+    F.commoncrawl_fetch(po, "https://a/1.pdf", log_)
+    F.commoncrawl_fetch(po, "https://a/2.pdf", log_)
+    assert po.calls == ["https://index.commoncrawl.org/collinfo.json"] and "503" in log_[-1]["result"]
+    F._cc_ids = (time.monotonic() - F.CC_COLLINFO_RETRY_S - 1,) + F._cc_ids[1:]        # an hour later: asked again
+    F.commoncrawl_fetch(po, "https://a/3.pdf", [])
+    assert len(po.calls) == 2

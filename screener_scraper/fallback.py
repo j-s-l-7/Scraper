@@ -36,6 +36,12 @@ CONCALL_RE = re.compile(r"transcript|concall|con-call|earnings[\s_%20-]*call|con
                         r"earning[\s_%20-]*call|call[\s_-]*script|prepared[\s_-]*remarks", re.I)
 PPT_RE = re.compile(r"presentation|investor[\s_%20-]*deck|\bppt\b|earnings[\s_%20-]*deck|results[\s_%20-]*deck", re.I)
 AR_RE = re.compile(r"annual[\s_%20-]*report", re.I)
+# Per document: after its n-th chain run, wait RETRY_BACKOFF_DAYS[min(n, 4) - 1] days before the next (7, 14, 28, then
+# every 56). The chain cost the concalls role 68% of its time for a 5.3% recovery when every missing document of a
+# company was retried whenever any one of them was due.
+RETRY_BACKOFF_DAYS = [7, 14, 28, 56]
+CC_COLLINFO_TTL = 24 * 3600   # Common Crawl's index list (about one new index a month): fetched once a day per process
+CC_COLLINFO_RETRY_S = 3600    # a failed fetch of it is not repeated for an hour
 MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
           "november", "december"]
 
@@ -383,13 +389,38 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def retry_company(db, company_id: int, run_id: int, kind: str, po: Optional[Polite] = None) -> dict:
-    """Run the fallback chain for every missing/failed document of the company's kind. Never raises for a single
-    document; returns counts by fetch_source."""
+def chain_runs(attempts_log) -> Tuple[int, Optional[datetime]]:
+    """(fallback-chain runs so far, when the last one ran) for one document. Every entry one run writes carries the
+    same `at`; 'primary' entries are the normal download's cooldown stamp (documents.py), not chain runs."""
+    ats = {e["at"] for e in attempts_log or [] if isinstance(e, dict) and e.get("at") and e.get("source") != "primary"}
+    last = None
+    for a in ats:
+        try:
+            t = datetime.fromisoformat(a)
+        except (TypeError, ValueError):
+            continue
+        t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+        last = t if last is None or t > last else last
+    return len(ats), last
+
+
+def chain_due(attempts_log, now: Optional[datetime] = None) -> bool:
+    """Whether the document's next chain run is due: never run, or RETRY_BACKOFF_DAYS passed since its last run.
+    fleet.retry_due is the same rule in SQL."""
+    n, last = chain_runs(attempts_log)
+    if n == 0 or last is None:
+        return True
+    wait = RETRY_BACKOFF_DAYS[min(n, len(RETRY_BACKOFF_DAYS)) - 1]
+    return last + timedelta(days=wait) <= (now or datetime.now(timezone.utc))
+
+
+def retry_company(db, company_id: int, run_id: int, kind: str, po: Optional[Polite] = None, force: bool = False) -> dict:
+    """Run the fallback chain for the company's missing/failed/no_text documents of the kind whose own schedule is due
+    (chain_due; force: all of them). Never raises for a single document; returns counts by fetch_source."""
     from . import documents as D
     po = po or Polite()
     doc_type = D.DOC_TYPE_OF[kind]
-    stats = {"tried": 0, "recovered": 0, "by_source": {}, "still_missing": 0, "seconds": 0.0}
+    stats = {"tried": 0, "recovered": 0, "by_source": {}, "still_missing": 0, "not_due": 0, "seconds": 0.0}
     t0 = time.monotonic()
     with db.trail.cursor() as cur:
         cur.execute("select coalesce(nse_symbol, screener_slug, bse_code), website from equity.company where company_id=%s",
@@ -399,6 +430,11 @@ def retry_company(db, company_id: int, run_id: int, kind: str, po: Optional[Poli
                        where company_id=%s and doc_type=%s and status in ('missing','failed','no_text') order by doc_date desc nulls last""",
                     (company_id, doc_type))
         todo = cur.fetchall()
+    if not force:
+        now = datetime.now(timezone.utc)
+        due = [r for r in todo if chain_due(r[5], now)]
+        stats["not_due"] = len(todo) - len(due)
+        todo = due
     site_cands: Optional[List[Tuple[str, str]]] = None
     site_notes: list = []
     used: set = set()
@@ -466,22 +502,24 @@ def retry_company(db, company_id: int, run_id: int, kind: str, po: Optional[Poli
                 res = {"status": "ok", "sha": sha, "page_count": len(pages), "char_count": sum(map(len, pages)),
                        "text_path": str(path.relative_to(config.ROOT)), "extractor": "openai-transcribe"}
                 source, fetched = "audio", url
+        at = _now()                       # one stamp per run: chain_runs counts the distinct stamps
         for e in log_:
-            e.setdefault("at", _now())
-        full_log = json.dumps((old_log or []) + log_)
+            e.setdefault("at", at)
+        new_log = json.dumps(log_)        # appended in SQL, so entries written meanwhile (documents.py) are kept
         with db.trail.cursor() as cur:
             if res is not None and res["status"] in ("ok", "no_text"):
                 D._set_status(cur, company_id, doc_type, url, res["status"],
                               **{k: v for k, v in res.items() if k != "status"})
-                cur.execute("""update equity.document set fetch_source=%s, fetched_url=%s, attempts_log=%s::jsonb
+                cur.execute("""update equity.document set fetch_source=%s, fetched_url=%s,
+                                   attempts_log=attempts_log || %s::jsonb
                                where company_id=%s and doc_type=%s and url=%s""",
-                            (source, fetched, full_log, company_id, doc_type, url))
+                            (source, fetched, new_log, company_id, doc_type, url))
                 stats["recovered"] += 1
                 stats["by_source"][source] = stats["by_source"].get(source, 0) + 1
                 log.info("%s %s %s: recovered via %s", symbol, doc_type, label, source)
             else:
-                cur.execute("update equity.document set attempts_log=%s::jsonb where company_id=%s and doc_type=%s and url=%s",
-                            (full_log, company_id, doc_type, url))
+                cur.execute("update equity.document set attempts_log=attempts_log || %s::jsonb "
+                            "where company_id=%s and doc_type=%s and url=%s", (new_log, company_id, doc_type, url))
                 stats["still_missing"] += 1
     stats["seconds"] = round(time.monotonic() - t0, 1)
     return stats
@@ -526,12 +564,33 @@ def warc_payload(data: bytes) -> Optional[bytes]:
     return None
 
 
+_cc_lock = threading.Lock()
+_cc_ids: Optional[Tuple[float, List[str], str]] = None      # (monotonic time fetched, index ids, why empty)
+
+
+def cc_index_ids(po: Polite) -> Tuple[List[str], str]:
+    """The latest Common Crawl index ids, fetched once per process rather than once per document: kept for
+    CC_COLLINFO_TTL, or CC_COLLINFO_RETRY_S after a failure. -> (ids, why the list is empty)."""
+    global _cc_ids
+    with _cc_lock:                          # threads of one process share one fetch
+        hit = _cc_ids
+        if hit is not None and time.monotonic() - hit[0] < (CC_COLLINFO_TTL if hit[1] else CC_COLLINFO_RETRY_S):
+            return hit[1], hit[2]
+        try:
+            st, data, _ = po.get("https://index.commoncrawl.org/collinfo.json", timeout=(15, 40))
+            ids = parse_collinfo(json.loads(data)) if st == 200 else []
+            why = "" if ids else f"no index list (HTTP {st})"
+        except Exception as e:              # Blocked, network, not JSON
+            ids, why = [], f"no index list ({type(e).__name__}: {str(e)[:120]})"
+        _cc_ids = (time.monotonic(), ids, why)
+        return ids, why
+
+
 def commoncrawl_fetch(po: Polite, url: str, log_: list) -> Optional[bytes]:
     try:
-        st, data, _ = po.get("https://index.commoncrawl.org/collinfo.json", timeout=(15, 40))
-        ids = parse_collinfo(json.loads(data)) if st == 200 else []
+        ids, why = cc_index_ids(po)
         if not ids:
-            log_.append({"source": "commoncrawl", "url": "collinfo", "result": f"no index list (HTTP {st})"})
+            log_.append({"source": "commoncrawl", "url": "collinfo", "result": why})
             return None
         t_end = time.monotonic() + 45                       # per-document time budget for the slow CC index
         for cid in ids:
