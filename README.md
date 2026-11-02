@@ -58,7 +58,7 @@ scripts/local-fleet.sh start|stop|status   # 6 local workers, one per source hos
 2. `lake-drive` in the background (own lock): load finished `equity-lake` runs, retry gaps, dispatch the next rank
    window; daily top-100 sync and `equity-docs`, weekly `equity-shards`
 3. restart any dead fleet worker
-4. `dq --db both` (once a day), `sources --daily` (in the background)
+4. `dq --db both` (once a day); public sources run in the fleet's `sources` worker
 5. `library.index` (incremental) and the batch report
 6. git autosync: commit and push code only when the full test suite passes and no secret-like string is staged;
    `touch data/.no-autosync` pauses it

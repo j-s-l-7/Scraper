@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import time
 from typing import List, Optional, Tuple
 
@@ -25,6 +26,15 @@ from .rank import TOP1000_CODE
 log = logging.getLogger(__name__)
 FIRST_RANK, LAST_RANK = 101, 1000
 RESCAN_S = 600
+COMPANY_MAX_S = 40 * 60       # under the fleet watchdog's 60 min, which restarts the whole pass from rank 101
+
+
+class CompanyTimeout(BaseException):
+    """SIGALRM after COMPANY_MAX_S. A BaseException so per-document `except Exception` handlers can't swallow it."""
+
+
+def _company_timeout(signum, frame):
+    raise CompanyTimeout(f"over {COMPANY_MAX_S // 60} min (a download that never finishes)")
 
 
 def source_ranks(src: DB) -> List[Tuple[int, int, str]]:
@@ -73,7 +83,9 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
     mine = select_for(role, ranked, index, of)
     run_id = db.start_run(f"fleet-{role}", {"index": index, "of": of, "companies": len(mine)})
     st = {"done": 0, "skipped": 0, "failed": 0, "ranked": len(ranked)}
+    signal.signal(signal.SIGALRM, _company_timeout)
     for rank, cid, sym in mine:
+        signal.alarm(COMPANY_MAX_S)          # a stuck socket read fails this company instead of hanging the pass
         try:
             if role == "screener":
                 if lake_has_fresh_screener(db, cid):
@@ -96,18 +108,19 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
                     run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, True, False, None)
             st["done"] += 1
             log.info("[%s] rank %d %s ok", role, rank, sym)
-        except BaseException as e:           # one company never stops the pass (SystemExit included)
+        except BaseException as e:           # one company never stops the pass (SystemExit, CompanyTimeout included)
             if isinstance(e, KeyboardInterrupt):
                 raise
             st["failed"] += 1
             log.warning("[%s] rank %d %s failed: %s: %s", role, rank, sym, type(e).__name__, str(e)[:200])
+        finally:
+            signal.alarm(0)
     db.finish_run(run_id, "partial" if st["failed"] else "success", st)
     return st
 
 
 def run_fleet_worker(role: str, index: int, of: int, once: bool = False) -> int:
     import faulthandler
-    import signal
     faulthandler.register(signal.SIGUSR1, all_threads=True)   # `kill -USR1 <pid>`: every thread's stack -> the log
     os.environ.setdefault("SUPABASE_TXN_POOL", "1")
     src_url = os.environ.get("SOURCE_DATABASE_URL")
