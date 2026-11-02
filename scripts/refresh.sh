@@ -45,7 +45,8 @@ done
 #     Never two at once: load_run starts by wiping the run's download dir, which would destroy the other's downloads.
 if mkdir data/.lake-drive.lock 2>/dev/null || { ! held data/.lake-drive.lock lake-drive &&
      rm -rf data/.lake-drive.lock && mkdir data/.lake-drive.lock; }; then
-  nohup bash -c "LC_ALL=en_US.UTF-8 '$PY' -m screener_scraper lake-drive; rm -rf data/.lake-drive.lock" \
+  # caffeinate -i: an idle sleep mid-download stalls every transfer (2 Nov: asleep 22:50-23:43, nothing loaded)
+  nohup caffeinate -i bash -c "LC_ALL=en_US.UTF-8 '$PY' -m screener_scraper lake-drive; rm -rf data/.lake-drive.lock" \
     >> "logs/lake_drive_$(date +%F).log" 2>&1 &
   echo $! > data/.lake-drive.lock/pid
 else

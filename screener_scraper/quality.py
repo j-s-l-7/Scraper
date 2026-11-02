@@ -345,27 +345,31 @@ def sync_active(conn) -> int:
         return cur.rowcount
 
 
-def gather_issues(conn, today: date, with_net: bool = True) -> List[Issue]:
-    issues: List[Issue] = []
-    active = [r[0] for r in rows(conn, "select company_id from equity.company where is_active")]
-    sym_of = dict(rows(conn, "select coalesce(nse_symbol, screener_slug), company_id from equity.company"))
-    cid_of_sym = sym_of
+# Screener vs yfinance; yfinance names in priority order. Banks' "Revenue" (interest earned) is not yfinance's Total
+# Revenue, so only "Sales" is compared. Screener's Net Profit includes minority interest, like yfinance's NCI line.
+RECON = (("recon_sales", ("profit-loss", ("Sales",)), ("yf-income", ("Total Revenue",)), 1.0),
+         ("recon_profit", ("profit-loss", ("Net Profit",)),
+          ("yf-income", ("Net Income Including Noncontrolling Interests", "Net Income")), 1.0),
+         ("recon_eps", ("profit-loss", ("EPS in Rs",)), ("yf-income", ("Diluted EPS",)), 0.5))
 
-    # ---- cross-source reconciliation (annual, basis C preferred) ----
-    def annual(section, names):
-        ids = {r[0]: r[1] for r in rows(conn, "select metric_id, name from equity.metric where section=%s and name = any(%s) "
-                                              "and parent_metric_id is null", (section, list(names)))}
-        out: Dict[Tuple[int, date], float] = {}
-        for cid, basis, pe, v in rows(conn, "select company_id, basis, period_end, value from equity.financial_fact "
-                                            "where metric_id = any(%s) and period_type='A' order by basis desc",
-                                      (list(ids),)):
-            out[(cid, pe)] = float(v)          # 'S' sorts after 'C' descending: C overwrites S
-        return out
-    for code, (sec, names), (ysec, yname), min_abs in (
-            ("recon_sales", ("profit-loss", ("Sales", "Revenue")), ("yf-income", "Total Revenue"), 1.0),
-            ("recon_profit", ("profit-loss", ("Net Profit",)), ("yf-income", "Net Income"), 1.0),
-            ("recon_eps", ("profit-loss", ("EPS in Rs",)), ("yf-income", "Diluted EPS"), 0.5)):
-        a, b = annual(sec, names), annual(ysec, (yname,))
+
+def annual_facts(conn, section: str, names: Sequence[str]) -> Dict[Tuple[int, date], float]:
+    ids = {r[0]: r[1] for r in rows(conn, "select metric_id, name from equity.metric where section=%s and name = any(%s) "
+                                          "and parent_metric_id is null", (section, list(names)))}
+    out: Dict[Tuple[int, date], float] = {}
+    for cid, basis, pe, v in rows(conn, "select company_id, basis, period_end, value from equity.financial_fact "
+                                        "where metric_id = any(%s) and period_type='A' order by basis desc",
+                                  (list(ids),)):
+        out[(cid, pe)] = float(v)          # 'S' sorts after 'C' descending: C overwrites S
+    return out
+
+
+def recon_issues(conn) -> List[Issue]:
+    issues: List[Issue] = []
+    for code, (sec, names), (ysec, ynames), min_abs in RECON:
+        a, b = annual_facts(conn, sec, names), {}
+        for yname in reversed(ynames):     # the first name wins where a company has both
+            b.update(annual_facts(conn, ysec, (yname,)))
         pairs = {}
         for (cid, pe), av in a.items():
             for k in (pe, pe + timedelta(days=1), pe - timedelta(days=1)):
@@ -373,6 +377,22 @@ def gather_issues(conn, today: date, with_net: bool = True) -> List[Issue]:
                     pairs[(cid, pe)] = (av, b[(cid, k)])
                     break
         issues += check_reconcile(code, pairs, min_abs=min_abs)
+    return issues
+
+
+def gather_issues(conn, today: date, with_net: bool = True, universe: Optional[str] = None) -> List[Issue]:
+    issues: List[Issue] = []
+    # a database is only expected to hold financials for its own universe (Supabase: TOP100_MCAP)
+    active = [r[0] for r in rows(conn, """select company_id from equity.company c where is_active and (%(u)s::text is null
+                                          or exists (select 1 from equity.universe u where u.company_id = c.company_id
+                                             and u.universe_code = %(u)s and u.as_of = (select max(as_of) from equity.universe
+                                                                                         where universe_code = %(u)s)))""",
+                                 {"u": universe})]
+    sym_of = dict(rows(conn, "select coalesce(nse_symbol, screener_slug), company_id from equity.company"))
+    cid_of_sym = sym_of
+
+    # ---- cross-source reconciliation (annual, basis C preferred) ----
+    issues += recon_issues(conn)
 
     # ---- statement identities ----
     inv = {r[0]: r[1] for r in rows(conn, "select metric_id, name from equity.metric where section='balance-sheet' "
@@ -722,14 +742,20 @@ def grow_universe(sup_conn, lake_conn) -> str:
                                        order by as_of desc limit 1) desc nulls last""", (code, code))
     state = dict(rows(lake_conn, "select key, value from public.lake_state where key in ('extra_windows','extra_ranked')"))
     extra = [tuple(map(int, w.split("-"))) for w in (state.get("extra_windows") or "").split(",") if w]
-    ranked_to = int(state.get("extra_ranked") or 1000)
+    as_of = rows(sup_conn, "select max(as_of) from equity.universe where universe_code=%s", (code,))[0][0]
+    # new ranks continue after the highest one in use: lake_state's extra_ranked missed a save on the early returns
+    # below and fell behind, which handed ranks 1001-1703 out twice
+    ranked_to = max(1000, rows(sup_conn, "select coalesce(max(rank), 0) from equity.universe where universe_code=%s "
+                                         "and as_of=%s", (code, as_of))[0][0])
     if cand:
-        as_of = rows(sup_conn, "select max(as_of) from equity.universe where universe_code=%s", (code,))[0][0]
         with sup_conn.cursor() as cur:
             for i, (cid, _) in enumerate(cand, start=ranked_to + 1):
                 cur.execute("insert into equity.universe (universe_code, as_of, company_id, rank) values (%s,%s,%s,%s) "
                             "on conflict do nothing", (code, as_of, cid, min(i, 32000)))
         ranked_to += len(cand)
+        with lake_conn.cursor() as cur:
+            cur.execute("insert into public.lake_state(key, value) values ('extra_ranked',%s) on conflict (key) do update "
+                        "set value=excluded.value, updated_at=now()", (str(ranked_to),))
     todo = [w for w in plan_extra_windows(1001, ranked_to) if w not in extra]
     if not todo:
         return "growth complete: no candidates remain" if not cand else "growth: nothing to add"
@@ -754,7 +780,7 @@ def run_dq(conn, name: str, db_url_env: Optional[str], today: Optional[date] = N
         return {"db": name, "skipped": "already ran today"}
     out: dict = {"db": name}
     out["deactivated_or_reactivated"] = sync_active(conn)
-    issues = gather_issues(conn, today)
+    issues = gather_issues(conn, today, universe="TOP100_MCAP" if name == "supabase" else None)
     if live:
         try:
             issues += close_vs_yf(conn, today)

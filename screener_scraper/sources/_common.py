@@ -269,6 +269,11 @@ def run_days(db, name: str, since: Optional[date], until: Optional[date], defaul
         status = "blocked"
         log.error("%s: BLOCKED (%s); final for this run", name, e)
         set_marker(db, name, blocked_on=today)
+    except Exception:       # keep the progress so far: the next run resumes after it instead of from the start
+        db.conn.rollback()
+        if last_ok and (not marker.get("last_date") or last_ok.isoformat() > marker["last_date"]):
+            set_marker(db, name, last_date=last_ok)
+        raise
     fields = {"status": status, "run_at": datetime.now(timezone.utc).isoformat()}
     if last_ok and (not marker.get("last_date") or last_ok.isoformat() > marker["last_date"] or not backfill):
         # a backfill that started earlier than the marker must not move the marker backwards

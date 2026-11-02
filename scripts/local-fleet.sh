@@ -40,7 +40,8 @@ start_one() {
     rm -f data/fleet/'"$name"'.pid
     echo "[fleet '"$name"'] paused"' >> "logs/fleet_$name.log" 2>&1 &
   echo $! > "data/fleet/$name.pid"
-  echo "started $name ($role $idx/$of) pid $(cat data/fleet/$name.pid)"
+  # also into the worker's log: a fresh line there keeps unstick from taking a long pause for a hang
+  echo "started $name ($role $idx/$of) pid $(cat data/fleet/$name.pid)" | tee -a "logs/fleet_$name.log"
 }
 
 # A healthy worker writes to its log at least every 30 min (longest sleep between passes). One silent for STALE_MIN

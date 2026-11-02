@@ -127,6 +127,65 @@ def test_extra_windows_plan():
     assert Q.plan_extra_windows(1001, 1700) == [(1001, 1300), (1301, 1600), (1601, 1700)]
 
 
+def test_recon_pairs_screener_with_the_matching_yf_line(monkeypatch):
+    fy = d(2025, 3, 31)
+    metric = {10: ("profit-loss", "Net Profit"), 11: ("profit-loss", "Revenue"), 20: ("yf-income", "Net Income"),
+              21: ("yf-income", "Net Income Including Noncontrolling Interests"), 22: ("yf-income", "Total Revenue")}
+    facts = {10: [(1, "C", fy, 54569.0), (2, "C", fy, 100.0)], 11: [(1, "C", fy, 75613.0)],
+             20: [(1, "C", fy, 51029.0), (2, "C", fy, 80.0)], 21: [(1, "C", fy, 54569.4)], 22: [(1, "C", fy, 32598.0)]}
+
+    def fake_rows(conn, sql, params=()):
+        if "from equity.metric" in sql:
+            return [(i, n) for i, (s, n) in metric.items() if s == params[0] and n in params[1]]
+        return [f for i in params[0] for f in facts.get(i, [])]
+    monkeypatch.setattr(Q, "rows", fake_rows)
+    out = {(i.check, i.company_id) for i in Q.recon_issues(None)}
+    assert ("recon_profit", 1) not in out       # ICICIBANK FY25: NCI-inclusive 54,569.4 matches Screener's 54,569
+    assert ("recon_sales", 1) not in out        # a bank's Revenue (interest earned) is not set against Total Revenue
+    assert ("recon_profit", 2) in out           # no NCI line: falls back to Net Income (100 vs 80)
+
+
+def test_grow_universe_never_hands_out_a_rank_twice(monkeypatch):
+    universe = {1: 1000}                         # company_id -> rank in the latest TOP1000_MCAP
+    state = {"extra_windows": "", "extra_ranked": "1000"}
+    batches = [[(5001, "A"), (5002, "B")], [(5003, "C")], [(5004, "D")]]
+
+    def fake_rows(conn, sql, params=()):
+        if "from public.lake_window" in sql:
+            return [(101, 400, "loaded"), (401, 700, "loaded"), (701, 1000, "loaded")]
+        if "universe_candidate" in sql:
+            return batches.pop(0)
+        if "from public.lake_state" in sql:
+            return list(state.items())
+        if "max(rank)" in sql:
+            return [(max(universe.values()),)]
+        if "max(as_of)" in sql:
+            return [(d(2026, 11, 1),)]
+        raise AssertionError(sql)
+
+    class Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params):
+            if "equity.universe" in sql:
+                universe.setdefault(params[2], params[3])
+            else:
+                k, v = ("extra_ranked", params[0]) if len(params) == 1 else params
+                state[k] = v
+
+    class Conn:
+        def cursor(self):
+            return Cur()
+    monkeypatch.setattr(Q, "rows", fake_rows)
+    for _ in batches[:]:                         # the 2nd and 3rd calls take the "window not loaded yet" return
+        Q.grow_universe(Conn(), Conn())
+    assert [universe[c] for c in (5001, 5002, 5003, 5004)] == [1001, 1002, 1003, 1004]
+
+
 def test_universe_latest():
     assert Q.universe_latest({1: d(2025, 9, 30), 2: d(2025, 9, 30), 3: d(2025, 6, 30), 4: d(2025, 12, 31)}) == d(2025, 9, 30)
 

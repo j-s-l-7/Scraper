@@ -20,7 +20,17 @@ READY_HOUR_IST = 19
 
 
 def parse(text: str) -> List[tuple]:
-    rd = csv.reader(io.StringIO(text))
+    return parse_rows(csv.reader(io.StringIO(text)))
+
+
+def parse_xlsx(raw: bytes) -> List[tuple]:
+    """Some days the archive serves an Excel workbook under the .csv name (08-Aug-2022), with the same columns."""
+    import openpyxl
+    ws = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True).worksheets[0]
+    return parse_rows(["" if v is None else str(v) for v in r] for r in ws.iter_rows(values_only=True))
+
+
+def parse_rows(rd) -> List[tuple]:
     hdr = [h.strip().upper() for h in next(rd)]
     ix = {h: i for i, h in enumerate(hdr)}
     if "SYMBOL" not in ix or "DATE1" not in ix:
@@ -49,6 +59,6 @@ def run(db, since: Optional[date] = None, until: Optional[date] = None) -> dict:
             r = f.get(URL.format(d=d))
         except c.NotFound:
             return None
-        rows = [x for x in parse(r.text) if x[2] == d]
+        rows = [x for x in (parse_xlsx(r.content) if r.content[:2] == b"PK" else parse(r.text)) if x[2] == d]
         return c.upsert(db, TABLE, COLS, PK, rows)
     return c.run_days(db, NAME, since, until, DEFAULT_SINCE, FLOOR, TABLE, load_day)

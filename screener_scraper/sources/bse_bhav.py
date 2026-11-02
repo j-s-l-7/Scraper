@@ -39,8 +39,10 @@ def parse_old(text: str, d: date) -> List[tuple]:
     rd = csv.DictReader(io.StringIO(text))
     out = []
     for r in rd:
-        r = {(k or "").strip(): (v or "").strip() for k, v in r.items()}
-        if not r.get("SC_CODE"):
+        if None in r:           # a line that ran into the next one (07-Feb-22): skip it rather than misalign
+            continue
+        r = {k.strip(): (v or "").strip() for k, v in r.items()}
+        if not r.get("SC_CODE", "").isdigit():      # ...and the broken tail it leaves behind
             continue
         out.append((r["SC_CODE"], r.get("ISIN_CODE") or None, d, c.num(r["OPEN"]), c.num(r["HIGH"]), c.num(r["LOW"]),
                     c.num(r["CLOSE"]), c.intn(r["NO_OF_SHRS"]), c.intn(r["NO_TRADES"]), c.num(r["NET_TURNOV"])))

@@ -25,7 +25,9 @@ from .lake_runner import seed
 from .rank import TOP1000_CODE
 
 log = logging.getLogger(__name__)
-FIRST_RANK, LAST_RANK = 101, 1000
+FIRST_RANK, LAST_RANK = 101, 32000   # every ranked company: grow_universe ranks NSE past 1000 (capped at 32000)
+YF_LAST_RANK = 1000           # yf refetches each company's full price history; past 1000 prices come from the bhavcopy
+SCREENER_FRESH_DAYS = 7       # one IP at ~106 s a company: a daily refresh of ~1,800 companies never finishes
 RESCAN_S = 600
 COMPANY_MAX_S = 40 * 60       # under the fleet watchdog's 60 min, which restarts the whole pass from rank 101
 RETRY_DAYS = 7                # fallback chain: minutes per company, ~6% recovery; weekly per company is plenty
@@ -68,15 +70,22 @@ def first_rank(db: DB) -> int:
 
 
 def select_for(role: str, ranked: List[Tuple[int, int, str]], index: int, of: int) -> List[Tuple[int, int, str]]:
-    """Which (rank, company_id, symbol) a process owns. screener: descending; every other role: all ranks, ascending."""
-    return sorted(ranked, key=lambda r: -r[0]) if role == "screener" else sorted(ranked)
+    """Which (rank, company_id, symbol) a process owns. screener: descending; yf: up to YF_LAST_RANK, ascending;
+    every other role: all ranks, ascending."""
+    if role == "screener":
+        return sorted(ranked, key=lambda r: -r[0])
+    return sorted(r for r in ranked if role != "yf" or r[0] <= YF_LAST_RANK)
 
 
-def lake_has_fresh_screener(db: DB, company_id: int, hours: int = 20) -> bool:
+def lake_has_fresh_screener(db: DB, company_id: int) -> bool:
+    """Scraped within SCREENER_FRESH_DAYS, or within 20 h while the latest quarter is still missing (results season)."""
     with db.trail.cursor() as cur:
         cur.execute("""select exists (select 1 from equity.financial_fact f join equity.metric m using (metric_id)
-                       where f.company_id=%s and m.source='screener' and f.updated_at > now() - make_interval(hours => %s))""",
-                    (company_id, hours))
+                       where f.company_id=%(c)s and m.source='screener' and f.updated_at > now() - case
+                         when exists (select 1 from equity.dq_issue i where i.company_id=%(c)s and i.status='open'
+                                      and i.check_code='latest_quarter_missing') then interval '20 hours'
+                         else make_interval(days => %(d)s) end)""",
+                    {"c": company_id, "d": SCREENER_FRESH_DAYS})
         return cur.fetchone()[0]
 
 

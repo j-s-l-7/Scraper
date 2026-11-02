@@ -33,8 +33,8 @@ RUNNERS = 20
 BUSY = {"queued", "in_progress", "waiting", "pending", "requested"}
 DOWNLOAD_PARALLEL = 8              # artifact downloads in flight at once
 DOWNLOAD_TIMEOUT = 3 * 3600        # per artifact; ~50 MB at ~12 KB/s takes ~70 min
-MAX_PART_FAILS = 4                 # a part that failed this often is given up; the window retry covers its ranks
-PART_BACKOFF_S = 3600              # after n failures a part waits 1h, 2h, 4h: giving up needs >= 7h of failures
+MAX_PART_FAILS = 6                 # a part that failed this often is given up; the window retry covers its ranks
+PART_BACKOFF_S = 900               # after n failures a part waits 15m, 30m, 1h, 2h, 4h: giving up needs >= 7.75h
 
 
 def repo() -> str:

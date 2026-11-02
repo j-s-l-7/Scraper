@@ -6,6 +6,7 @@ import unittest
 import zipfile
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 from screener_scraper.sources import bse_bhav, bulk_block, credit_ratings, fo_bhav, gdelt_news, macro, nse_bhav_full
 from screener_scraper.sources import _common as c
@@ -33,6 +34,32 @@ class TestBhav(unittest.TestCase):
 
     def test_bse_missing_page(self):
         self.assertIsNone(bse_bhav.parse_bytes(b"<!DOCTYPE html><html>not found</html>", date(2024, 5, 1)))
+
+    def test_nse_full_served_as_xlsx(self):
+        rows = nse_bhav_full.parse_xlsx((FX / "nse_full_xlsx_small.xlsx").read_bytes())
+        self.assertEqual(len(rows), 3)
+        r = rows[0]
+        self.assertEqual((r[0], r[1], r[2]), ("20MICRONS", "EQ", date(2022, 8, 8)))
+        self.assertEqual((r[8], r[10], r[13], r[14]), (111.15, 1687369, 571768, 33.89))
+
+    def test_bse_old_line_run_into_the_next(self):
+        old = bse_bhav.parse_bytes((FX / "bse_old_broken_line.zip").read_bytes(), date(2022, 2, 7))
+        self.assertEqual([r[0] for r in old], ["500002", "500003", "531246"])
+        self.assertEqual(old[2][3:7], (32.45, 33.0, 32.0, 32.0))
+
+    def test_a_failing_day_keeps_the_days_before_it(self):
+        saved = {}
+
+        def load_day(d):
+            if d == date(2022, 8, 10):
+                raise ValueError("unreadable file")
+            return 1
+        with mock.patch.object(c, "get_marker", return_value={"last_date": "2022-08-05"}), \
+                mock.patch.object(c, "set_marker", side_effect=lambda db, name, **kv: saved.update(kv)), \
+                mock.patch.object(c, "today_ist", return_value=date(2022, 8, 12)):
+            with self.assertRaises(ValueError):
+                c.run_days(mock.MagicMock(), "x", None, None, date(2019, 9, 20), date(2019, 9, 20), "t", load_day)
+        self.assertEqual(saved, {"last_date": date(2022, 8, 9)})
 
     def test_bulk_block(self):
         b = bulk_block.parse((FX / "bulk.csv").read_text(), "bulk")

@@ -60,3 +60,11 @@ class Pause(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Ranks(unittest.TestCase):
+    def test_yf_stops_at_rank_1000_while_the_other_roles_go_on(self):
+        ranked = [(1001, 3, "CCC"), (999, 1, "AAA"), (1000, 2, "BBB")]
+        self.assertEqual([r[0] for r in fleet.select_for("yf", ranked, 0, 1)], [999, 1000])
+        self.assertEqual([r[0] for r in fleet.select_for("bse", ranked, 0, 1)], [999, 1000, 1001])
+        self.assertEqual([r[0] for r in fleet.select_for("screener", ranked, 0, 1)], [1001, 1000, 999])
