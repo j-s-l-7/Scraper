@@ -24,7 +24,7 @@ import requests
 from psycopg2.extras import execute_values
 
 from . import config
-from .http import FetchError, safe_name
+from .http import MAX_GET_S, FetchError, safe_name
 from .rules import BLOCK_RE, DocNotFound, NoTextError
 
 log = logging.getLogger(__name__)
@@ -130,16 +130,48 @@ def doc_headers(url: str) -> dict:
     return {}      # plain GETs only: no Referer / cookie tricks
 
 
+# Per-host breaker, one per process: a host whose last BREAK_AFTER downloads all failed on the network (timeouts,
+# resets, MAX_GET_S) is skipped for BREAK_S. A dead IR host otherwise costs ~75 s per document on every pass.
+BREAK_AFTER, BREAK_S = 3, 3600
+_breaker_lock = threading.Lock()
+_breaker: Dict[str, Tuple[int, float]] = {}        # host -> (downloads failed in a row, skipped until; monotonic)
+
+
+def _host_skipped(host: str) -> Optional[str]:
+    with _breaker_lock:
+        n, until = _breaker.get(host, (0, 0.0))
+    left = until - time.monotonic()
+    return f"{host} skipped for {left / 60:.0f} more min: its last {n} downloads failed on the network" \
+        if left > 0 else None
+
+
+def _host_result(host: str, network_failed: bool) -> None:
+    """Any HTTP answer resets the host (status codes never count); a download that failed on the network counts one."""
+    with _breaker_lock:
+        if not network_failed:
+            _breaker.pop(host, None)
+            return
+        n = _breaker.get(host, (0, 0.0))[0] + 1
+        _breaker[host] = (n, time.monotonic() + BREAK_S if n >= BREAK_AFTER else 0.0)
+
+
 def download(url: str, spacer: Spacer = None, tries: int = 3) -> bytes:
     """GET with polite spacing. 404/410 -> DocNotFound; 403/429/5xx/network -> FetchError (status_code=None: network).
-    429 is retried in-process with a doubling interval; 403 is raised at once (rule R2 decides)."""
+    429 is retried in-process with a doubling interval; 403 is raised at once (rule R2 decides). A body still arriving
+    after MAX_GET_S raises FetchError without a retry; a host the breaker skips raises FetchError with no request."""
     spacer = spacer or _spacer
+    host = urlparse(url).netloc.lower()
+    skipped = _host_skipped(host)
+    if skipped:
+        raise FetchError(skipped, None, 0)
     last: Optional[Exception] = None
     for attempt in range(1, tries + 1):
         spacer.wait()
         try:
+            t0 = time.monotonic()
             r = _session().get(url, headers=doc_headers(url), timeout=(15, 120), stream=True)
             try:
+                _host_result(host, False)
                 st = r.status_code
                 if st in (404, 410):
                     raise DocNotFound(f"HTTP {st} for {url}")
@@ -157,10 +189,14 @@ def download(url: str, spacer: Spacer = None, tries: int = 3) -> bytes:
                 if st >= 400:
                     raise DocNotFound(f"HTTP {st} for {url}")
                 buf = io.BytesIO()
-                for chunk in r.iter_content(1 << 20):
+                for chunk in r.iter_content(1 << 16):        # small reads, so the MAX_GET_S check runs often
                     buf.write(chunk)
                     if buf.tell() > MAX_BYTES:
                         raise DocNotFound(f"larger than {MAX_BYTES >> 20} MB: {url}")
+                    if time.monotonic() - t0 > MAX_GET_S:
+                        _host_result(host, True)
+                        raise FetchError(f"still downloading after {MAX_GET_S // 60} min "
+                                         f"({buf.tell() >> 20} MB so far): {url}", None, attempt)
                 spacer.on_ok()
                 return buf.getvalue()
             finally:
@@ -169,6 +205,8 @@ def download(url: str, spacer: Spacer = None, tries: int = 3) -> bytes:
             last = FetchError(f"{type(e).__name__}: {e}", None, attempt)
             time.sleep(5 * attempt)
     assert last is not None
+    if getattr(last, "status", 0) is None:            # every attempt failed on the network
+        _host_result(host, True)
     raise last
 
 

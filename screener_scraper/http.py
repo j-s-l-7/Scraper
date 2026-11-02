@@ -21,6 +21,7 @@ import requests
 from . import config
 
 log = logging.getLogger(__name__)
+MAX_GET_S = 20 * 60     # one document download, start to finish: a server trickling bytes can't hold a worker or runner
 
 
 @dataclass

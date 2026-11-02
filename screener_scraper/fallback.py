@@ -21,6 +21,7 @@ from urllib.parse import quote, urljoin, urlparse, urldefrag
 import requests
 
 from . import config
+from .http import MAX_GET_S
 from .rules import BLOCK_RE, DocNotFound
 
 log = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class Polite:
         for attempt in (1, 2):
             self._wait(host)
             try:
+                t0 = time.monotonic()
                 r = self.s.get(url, timeout=timeout, stream=True, headers=headers)
                 try:
                     st = r.status_code
@@ -82,11 +84,13 @@ class Polite:
                         last = RuntimeError(f"HTTP {st}")
                         continue
                     body, n = [], 0
-                    for chunk in r.iter_content(1 << 20):
+                    for chunk in r.iter_content(1 << 16):        # small reads, so the MAX_GET_S check runs often
                         body.append(chunk)
                         n += len(chunk)
                         if n > max_bytes:
                             return 413, b"", r.headers.get("Content-Type", "")
+                        if time.monotonic() - t0 > MAX_GET_S:   # a server trickling bytes: give up, no retry
+                            raise TimeoutError(f"still downloading after {MAX_GET_S // 60} min: {url}")
                     data = b"".join(body)
                     ct = r.headers.get("Content-Type", "")
                 finally:
