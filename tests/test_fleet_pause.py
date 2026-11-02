@@ -24,7 +24,7 @@ class Pause(unittest.TestCase):
     def run_pass(self, scrape):
         db = mock.Mock()
         with mock.patch.object(fleet, "source_ranks", return_value=RANKED), \
-                mock.patch.object(fleet, "first_rank", return_value=101), mock.patch.object(fleet, "seed"), \
+                mock.patch.object(fleet, "first_rank", return_value=101), mock.patch.object(fleet, "seed_if_changed"), \
                 mock.patch.object(fleet, "lake_has_fresh_screener", return_value=False), \
                 mock.patch("screener_scraper.pipeline.scrape_company", side_effect=scrape):
             return fleet.run_pass("screener", 0, 1, db, mock.Mock()), db

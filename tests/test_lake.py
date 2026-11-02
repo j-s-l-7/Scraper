@@ -149,6 +149,98 @@ class FleetRouting(unittest.TestCase):
         assert [r[0] for r in select_for("bse", ranked, 0, 1)] == [101, 102, 103]
 
 
+
+class _SrcCur:
+    """Supabase stand-in: answers by SQL substring and records every statement."""
+    def __init__(self, src):
+        self.src, self.rows, self.description = src, [], None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=()):
+        self.src.sql.append((sql, params))
+        cols, rows = next((v for k, v in self.src.answers.items() if k in sql), (["x"], []))
+        self.description, self.rows = [(c,) for c in cols], rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _Src:
+    def __init__(self, answers):
+        self.answers, self.sql = answers, []
+        self.trail = self
+
+    def cursor(self):
+        return _SrcCur(self)
+
+
+class Seed(unittest.TestCase):
+    """fleet passes seeded identity + universe rows company by company: 2 Supabase queries x ~2,518 companies
+    (~10.7 min) on every pass of every role, although the lake already had every row."""
+    N = 2518
+
+    def ranked(self, n=N):
+        return [(100 + i, 5000 + i, f"S{i}") for i in range(1, n + 1)]
+
+    def test_seed_is_three_queries_whatever_the_number_of_companies(self):
+        from screener_scraper import lake_runner
+        ranked = self.ranked()
+        src = _Src({"u.rank = any": (["rank", "company_id", "symbol"], ranked),
+                    "from equity.company": (["company_id", "name"], [(c, s) for _, c, s in ranked]),
+                    "from equity.universe": (["universe_code", "as_of", "company_id", "rank"],
+                                             [("TOP1000_MCAP", "2026-11-01", c, r) for r, c, _ in ranked])})
+        dst = mock.MagicMock()
+        with mock.patch.object(lake_runner, "execute_values") as ev:
+            assert lake_runner.seed(src, dst, [r for r, _, _ in ranked]) == ranked
+        assert len(src.sql) == 3 and all("= any(%s)" in q for q, _ in src.sql)
+        assert sorted(src.sql[1][1][0]) == [c for _, c, _ in ranked]
+        assert [len(c.args[2]) for c in ev.call_args_list] == [self.N, self.N]
+        assert all("on conflict do nothing" in c.args[1] for c in ev.call_args_list)       # insert-only: idempotent
+        assert "equity.company" in ev.call_args_list[0].args[1]                             # before its universe rows
+
+    def test_the_fleet_seeds_only_when_supabase_changed(self):
+        from screener_scraper import fleet
+        state = {}
+
+        class LakeCur(_SrcCur):
+            def execute(self, sql, params=()):
+                if sql.lstrip().startswith("insert into public.lake_state"):
+                    state[params[0]] = params[1]
+                self.rows = [(state[params[0]],)] if "from public.lake_state" in sql and params[0] in state else []
+
+        lake_db = _Src({})
+        lake_db.cursor = lambda: LakeCur(lake_db)
+        as_of = {"v": "2026-11-01"}
+        src = _Src({})
+        src.cursor = lambda: type("C", (_SrcCur,), {"execute": lambda self, q, p=(): setattr(
+            self, "rows", [(as_of["v"],)])})(src)
+        ranked = self.ranked(5)
+        with mock.patch.object(fleet, "seed") as seed:
+            assert fleet.seed_if_changed(src, lake_db, ranked)            # first pass: seeds, saves the marker
+            assert not fleet.seed_if_changed(src, lake_db, ranked)        # unchanged: skipped
+            as_of["v"] = "2026-11-08"
+            assert fleet.seed_if_changed(src, lake_db, ranked)            # a new ranking day
+            assert fleet.seed_if_changed(src, lake_db, ranked + [(200, 9999, "NEW")])     # a new company
+            assert not fleet.seed_if_changed(src, lake_db, ranked + [(200, 9999, "NEW")])
+        assert seed.call_count == 3 and seed.call_args.args[2] == [r for r, _, _ in ranked] + [200]
+
+    def test_a_broken_marker_falls_back_to_seeding(self):
+        from screener_scraper import fleet
+        src, lake_db = mock.Mock(), mock.Mock()
+        lake_db.trail.cursor.side_effect = RuntimeError("relation public.lake_state does not exist")
+        with mock.patch.object(fleet, "seed") as seed, self.assertLogs(fleet.log, "WARNING"):
+            assert fleet.seed_if_changed(src, lake_db, self.ranked(3))
+        seed.assert_called_once()
+
+
 def _lake_up():
     try:
         import psycopg2

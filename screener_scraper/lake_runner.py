@@ -32,18 +32,20 @@ def window_ranks(from_rank: int, to_rank: int, explicit: Optional[str] = None) -
     return list(range(from_rank, to_rank + 1))
 
 
-def _copy_row_set(src_cur, dst_cur, table: str, where: str, params: tuple) -> int:
+def _copy_row_set(src_cur, dst_cur, table: str, where: str, params: tuple, page_size: int = 100) -> int:
     src_cur.execute(f"select * from equity.{table} where {where}", params)
     cols = [d[0] for d in src_cur.description]
     rows = src_cur.fetchall()
     if rows:
-        execute_values(dst_cur, f"insert into equity.{table} ({', '.join(cols)}) values %s on conflict do nothing", rows)
+        execute_values(dst_cur, f"insert into equity.{table} ({', '.join(cols)}) values %s on conflict do nothing", rows,
+                       page_size=page_size)
     return len(rows)
 
 
 def seed(src: DB, dst: DB, ranks: List[int], universe: str = TOP1000_CODE) -> List[tuple]:
-    """Copy identity + universe rows for `ranks` from Supabase into the runner-local PG.
-    Returns [(rank, company_id, symbol)] in rank order."""
+    """Copy identity + universe rows for `ranks` from Supabase into the runner-local PG (or the lake, for the fleet):
+    three Supabase queries whatever the number of companies. Insert-only (on conflict do nothing), so re-runs never
+    duplicate or change a row. Returns [(rank, company_id, symbol)] in rank order."""
     with src.trail.cursor() as cur:
         cur.execute("""select u.rank, c.company_id, coalesce(c.nse_symbol, c.screener_slug)
                        from equity.universe u join equity.company c using (company_id)
@@ -51,11 +53,13 @@ def seed(src: DB, dst: DB, ranks: List[int], universe: str = TOP1000_CODE) -> Li
                              where universe_code=%s) and u.rank = any(%s) order by u.rank""",
                     (universe, universe, ranks))
         chosen = cur.fetchall()
-        with dst.conn:
-            with dst.conn.cursor() as dcur:
-                for _, cid, _ in chosen:
-                    _copy_row_set(cur, dcur, "company", "company_id=%s", (cid,))
-                    _copy_row_set(cur, dcur, "universe", "company_id=%s and universe_code=%s", (cid, universe))
+        ids = sorted({cid for _, cid, _ in chosen})
+        if ids:
+            with dst.conn:
+                with dst.conn.cursor() as dcur:            # company rows first: universe references them
+                    _copy_row_set(cur, dcur, "company", "company_id = any(%s)", (ids,), page_size=1000)
+                    _copy_row_set(cur, dcur, "universe", "company_id = any(%s) and universe_code=%s", (ids, universe),
+                                  page_size=1000)
     return chosen
 
 

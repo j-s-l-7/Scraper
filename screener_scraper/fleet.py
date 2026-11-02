@@ -13,6 +13,7 @@ Doc roles only process companies that already have document_link rows (re-scanne
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import signal
@@ -32,6 +33,7 @@ SCREENER_FRESH_DAYS = 7       # one IP at ~106 s a company: a daily refresh of ~
 RESCAN_S = 600
 COMPANY_MAX_S = 40 * 60       # under the fleet watchdog's 60 min, which restarts the whole pass from rank 101
 PAUSE_FLAG = config.ROOT / "data" / "fleet" / "paused"   # `scripts/local-fleet.sh pause|resume`
+SEED_KEY = "fleet_seed"       # public.lake_state: Supabase's TOP1000_MCAP as_of + rank set at the last seed
 
 
 class CompanyTimeout(BaseException):
@@ -67,6 +69,39 @@ def first_rank(db: DB) -> int:
     """1 once the lake is primary for the top 100 (Supabase full, R8): the fleet then keeps them fresh too."""
     from .lake import top100_on_lake
     return 1 if top100_on_lake(db.trail) else FIRST_RANK
+
+
+def seed_fingerprint(src: DB, ranked: List[Tuple[int, int, str]]) -> str:
+    with src.trail.cursor() as cur:
+        cur.execute("select max(as_of) from equity.universe where universe_code=%s", (TOP1000_CODE,))
+        as_of = cur.fetchone()[0]
+    ranks = hashlib.sha1(",".join(f"{r}:{c}" for r, c, _ in sorted(ranked)).encode()).hexdigest()[:16]
+    return f"{TOP1000_CODE}:{as_of}:{len(ranked)}:{ranks}"
+
+
+def seed_if_changed(src: DB, db: DB, ranked: List[Tuple[int, int, str]]) -> bool:
+    """seed() the lake unless Supabase's TOP1000_MCAP as_of and rank set are those of the last seed (lake_state
+    SEED_KEY). Per company, the seed was 2 Supabase queries x ~2,518 companies (~10.7 min) every pass of every role.
+    An unreadable marker falls back to seeding. Returns whether it seeded."""
+    fp = None
+    try:
+        fp = seed_fingerprint(src, ranked)
+        with db.trail.cursor() as cur:
+            cur.execute("select value from public.lake_state where key=%s", (SEED_KEY,))
+            r = cur.fetchone()
+        if r and r[0] == fp:
+            return False
+    except Exception as e:
+        log.warning("seed marker unavailable (%s: %s): seeding every company", type(e).__name__, str(e)[:200])
+    seed(src, db, [r[0] for r in ranked])
+    if fp:
+        try:
+            with db.trail.cursor() as cur:
+                cur.execute("insert into public.lake_state(key, value) values (%s,%s) on conflict (key) do update "
+                            "set value=excluded.value, updated_at=now()", (SEED_KEY, fp))
+        except Exception as e:
+            log.warning("seed marker not saved (%s: %s)", type(e).__name__, str(e)[:200])
+    return True
 
 
 def select_for(role: str, ranked: List[Tuple[int, int, str]], index: int, of: int) -> List[Tuple[int, int, str]]:
@@ -124,7 +159,7 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
     from .pipeline import scrape_company
     from .yf import run_company as yf_company
     ranked = source_ranks(src, first_rank(db))
-    seed(src, db, [r[0] for r in ranked])   # identity + universe rows so every worker can resolve companies
+    seed_if_changed(src, db, ranked)        # identity + universe rows so every worker can resolve companies
     mine = select_for(role, ranked, index, of)
     run_id = db.start_run(f"fleet-{role}", {"index": index, "of": of, "companies": len(mine)})
     st = {"done": 0, "skipped": 0, "failed": 0, "ranked": len(ranked)}
