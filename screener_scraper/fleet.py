@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 FIRST_RANK, LAST_RANK = 101, 1000
 RESCAN_S = 600
 COMPANY_MAX_S = 40 * 60       # under the fleet watchdog's 60 min, which restarts the whole pass from rank 101
+RETRY_DAYS = 7                # fallback chain: minutes per company, ~6% recovery; weekly per company is plenty
 
 
 class CompanyTimeout(BaseException):
@@ -67,6 +68,18 @@ def has_links(db: DB, company_id: int, doc_types: List[str]) -> bool:
         return cur.fetchone()[0]
 
 
+def retry_due(db: DB, company_id: int, doc_types: List[str]) -> bool:
+    """A missing/failed/no_text document whose fallback chain last ran over RETRY_DAYS ago, or never
+    (attempts_log entries are written only by fallback.retry_company, each stamped `at`)."""
+    with db.trail.cursor() as cur:
+        cur.execute("""select exists (select 1 from equity.document d where d.company_id=%s and d.doc_type = any(%s)
+                         and d.status in ('missing','failed','no_text')
+                         and coalesce((select max((e->>'at')::timestamptz) from jsonb_array_elements(d.attempts_log) e),
+                                      '-infinity') < now() - make_interval(days => %s))""",
+                    (company_id, doc_types, RETRY_DAYS))
+        return cur.fetchone()[0]
+
+
 def yf_done_today(db: DB, company_id: int) -> bool:
     with db.trail.cursor() as cur:
         cur.execute("select exists (select 1 from equity.yf_snapshot where company_id=%s and as_of=current_date)",
@@ -104,7 +117,7 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
                     continue
                 hosts = {"bse": {"bse"}, "nse": {"nse", "other"}}.get(role)
                 run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, False, False, hosts)
-                if role == "concalls":      # fallback chain for transcripts / presentations still missing
+                if role == "concalls" and retry_due(db, cid, kinds):   # fallback chain for docs still missing
                     run_docs_cli(db, [sym], kinds, False, None, TOP1000_CODE, None, 1, True, False, None)
             st["done"] += 1
             log.info("[%s] rank %d %s ok", role, rank, sym)
