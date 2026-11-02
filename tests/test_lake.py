@@ -4,13 +4,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from screener_scraper import lake  # noqa: E402
-from screener_scraper.lake_drive import (due, fails_of, next_window, plan_parts, ranks_str, retry_action,  # noqa: E402
-                                         week_key)
+from screener_scraper import lake, lake_drive as LD  # noqa: E402
+from screener_scraper.lake_drive import (MAX_PART_FAILS, PART_BACKOFF_S, due, fails_of, gave_up_ranks,  # noqa: E402
+                                         next_window, part_due, plan_parts, ranks_str, retry_action, week_key)
 from screener_scraper.lake_runner import runner_ranks, window_ranks  # noqa: E402
 from screener_scraper.rank import parse_candidates  # noqa: E402
 
@@ -41,14 +42,78 @@ class WindowMath(unittest.TestCase):
 
 
 class LoaderBookkeeping(unittest.TestCase):
-    def test_parts_given_up_after_two_failed_downloads(self):
+    def test_parts_given_up_after_max_failures(self):
         assert fails_of("failed 2") == 2 and fails_of("loaded") == 0 and fails_of(None) == 0
         assert fails_of("failed x") == 0 and fails_of("no_artifacts: boom") == 0
         names = ["lake-1-1", "lake-1-2", "lake-1-3", "lake-1-4"]
-        logged = {"lake-1-1": "loaded", "lake-1-2": "failed 1", "lake-1-3": "failed 2"}
+        logged = {"lake-1-1": "loaded", "lake-1-2": "failed 1", "lake-1-3": f"failed {MAX_PART_FAILS}"}
         assert plan_parts(names, logged) == (["lake-1-2", "lake-1-4"], ["lake-1-3"])
+        assert plan_parts(["a"], {"a": f"failed {MAX_PART_FAILS - 1}"}) == (["a"], [])  # a waiting part keeps the run open
         assert plan_parts(names, {n: "loaded" for n in names}) == ([], [])
         assert plan_parts([], {}) == ([], [])           # a finished run without artifacts has nothing left to load
+
+    def test_failed_parts_back_off_so_an_outage_cannot_give_them_up(self):
+        h = PART_BACKOFF_S
+        assert part_due(None, 0) and not part_due("failed 1", h - 1) and part_due("failed 1", h)
+        assert not part_due("failed 3", 4 * h - 1) and part_due("failed 3", 4 * h)
+        assert sum(h * 2 ** (n - 1) for n in range(1, MAX_PART_FAILS)) >= 7 * 3600      # giving up takes >= 7 h
+
+    def test_given_up_parts_map_to_their_ranks(self):
+        assert gave_up_ranks(window_ranks(401, 700), ["lake-9-4"]) == list(range(404, 701, 20))
+        assert gave_up_ranks(window_ranks(401, 700), []) == []
+
+    def test_a_part_that_fails_to_load_is_counted_not_raised(self):
+        sql = []
+
+        class Cur:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, q, p=()): sql.append((q, p))
+            def fetchall(self): return []
+
+        class Conn:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def cursor(self): return Cur()
+            def rollback(self): pass
+
+        def download(cmd, **kw):        # `gh run download ... -D <dir>` lands one export file
+            out = Path(cmd[cmd.index("-D") + 1]) / "export"
+            out.mkdir(parents=True)
+            (out / "t.000001.csv.gz").write_bytes(b"")
+            return mock.Mock(returncode=0, stderr="")
+
+        def gh(*a, **k):
+            return "lake-9-1" if a[0] == "api" else "completed"
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(LD, "ARTIFACT_DIR", Path(tmp)), \
+                mock.patch.object(LD, "gh", gh), mock.patch.object(LD.subprocess, "run", download), \
+                mock.patch.object(LD, "load_export_dir", side_effect=KeyError("metric_id without mapping")):
+            res = LD.load_run(9, Conn())
+        assert not res.complete and res.gave_up == []
+        assert (9, "lake-9-1", "failed 1") in [p for _, p in sql] and not any("__complete__" in q for q, _ in sql)
+
+    def test_secrets_ready_tells_unreachable_from_missing(self):
+        with mock.patch.object(LD, "gh", side_effect=RuntimeError("error connecting to api.github.com")):
+            assert LD.secrets_ready() is None
+        with mock.patch.object(LD, "gh", return_value='[{"name": "DATABASE_URL"}]'):
+            assert LD.secrets_ready() is True
+        with mock.patch.object(LD, "gh", return_value="[]"):
+            assert LD.secrets_ready() is False
+
+    def test_dispatch_finds_its_own_run_through_a_polling_blip(self):
+        late = "2999-01-01T00:00:00Z"
+        other = {"databaseId": 6, "createdAt": late, "displayTitle": "lake 101-400"}
+        mine = {"databaseId": 7, "createdAt": late, "displayTitle": "lake 401-700"}
+        polls = iter([[], RuntimeError("EOF"), [other], [other, mine]])
+
+        def list_runs(workflow, limit):
+            x = next(polls)
+            if isinstance(x, Exception):
+                raise x
+            return x
+        with mock.patch.object(LD, "list_runs", list_runs), mock.patch.object(LD, "gh"), mock.patch("time.sleep"):
+            assert LD.dispatch("equity-lake.yml", {"from_rank": "401"}, title="lake 401-700") == 7
 
     def test_one_retry_per_window_never_while_busy(self):
         assert retry_action([118], 1, False, False) == "dispatch"

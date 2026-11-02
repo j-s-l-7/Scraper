@@ -33,7 +33,8 @@ RUNNERS = 20
 BUSY = {"queued", "in_progress", "waiting", "pending", "requested"}
 DOWNLOAD_PARALLEL = 8              # artifact downloads in flight at once
 DOWNLOAD_TIMEOUT = 3 * 3600        # per artifact; ~50 MB at ~12 KB/s takes ~70 min
-MAX_PART_FAILS = 2                 # a part whose download failed this often is given up; the window retry covers it
+MAX_PART_FAILS = 4                 # a part that failed this often is given up; the window retry covers its ranks
+PART_BACKOFF_S = 3600              # after n failures a part waits 1h, 2h, 4h: giving up needs >= 7h of failures
 
 
 def repo() -> str:
@@ -80,6 +81,19 @@ def plan_parts(names: List[str], logged: Dict[str, str]) -> Tuple[List[str], Lis
     return [n for n in open_ if n not in gave_up], gave_up
 
 
+def part_due(status: Optional[str], age_s: float) -> bool:
+    """A part that failed n times is tried again PART_BACKOFF_S * 2**(n-1) after its last failure, so an internet
+    outage of an hour or two can't use up its tries."""
+    n = fails_of(status)
+    return n == 0 or age_s >= PART_BACKOFF_S * 2 ** (n - 1)
+
+
+def gave_up_ranks(ranks: List[int], gave_up: List[str]) -> List[int]:
+    """The window ranks carried by given-up parts (lake-<run>-<k> holds runner k's slice)."""
+    from .lake_runner import runner_ranks
+    return sorted({r for n in gave_up for r in runner_ranks(ranks, int(n.rsplit("-", 1)[1]), RUNNERS)})
+
+
 def retry_action(miss: List[int], attempt: int, retried: bool, busy: bool) -> str:
     """A loaded window's missing ranks get ONE retry window: 'dispatch' it now, 'wait' while another lake run is in
     progress (a newer queued run would cancel a pending one), or 'none'."""
@@ -101,13 +115,14 @@ def extra_windows(conn) -> List[Tuple[int, int]]:
 
 
 # ───────────────────────────── gh wrappers ─────────────────────────────
-def secrets_ready() -> bool:
+def secrets_ready() -> Optional[bool]:
+    """Whether DATABASE_URL is set on the repo; None when GitHub can't be asked (e.g. the internet is down)."""
     try:
         out = gh("secret", "list", "-R", repo(), "--json", "name")
-        return "DATABASE_URL" in {s["name"] for s in json.loads(out or "[]")}
     except Exception as e:
         log.warning("secret check failed: %s", e)
-        return False
+        return None
+    return "DATABASE_URL" in {s["name"] for s in json.loads(out or "[]")}
 
 
 def list_runs(workflow: str, limit: int = 30) -> List[dict]:
@@ -116,8 +131,8 @@ def list_runs(workflow: str, limit: int = 30) -> List[dict]:
     return json.loads(out or "[]")
 
 
-def dispatch(workflow: str, fields: Dict[str, str], ref: str = "main") -> Optional[int]:
-    """Dispatch a workflow and return the new run id (found by polling)."""
+def dispatch(workflow: str, fields: Dict[str, str], ref: str = "main", title: Optional[str] = None) -> Optional[int]:
+    """Dispatch a workflow and return the new run id (found by polling; with `title`, only a run of that name)."""
     t0 = datetime.now(timezone.utc) - timedelta(seconds=10)
     before = {r["databaseId"] for r in list_runs(workflow, 5)}
     args = ["workflow", "run", workflow, "-R", repo(), "--ref", ref]
@@ -126,9 +141,13 @@ def dispatch(workflow: str, fields: Dict[str, str], ref: str = "main") -> Option
     gh(*args)
     for _ in range(20):
         time.sleep(4)
-        for r in list_runs(workflow, 5):
+        try:
+            runs = list_runs(workflow, 5)
+        except Exception:               # the run exists already: a network blip here must not lose its id
+            continue
+        for r in runs:
             created = datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
-            if r["databaseId"] not in before and created >= t0:
+            if r["databaseId"] not in before and created >= t0 and title in (None, r["displayTitle"]):
                 return r["databaseId"]
     return None
 
@@ -147,7 +166,7 @@ def state_set(cur, key: str, value: str) -> None:
 
 class Loaded(NamedTuple):
     rows: Dict[str, int]          # rows loaded per table by this call
-    gave_up: List[str]            # parts given up after MAX_PART_FAILS failed downloads
+    gave_up: List[str]            # parts given up after MAX_PART_FAILS failed downloads or loads
     complete: bool                # the run has finished and every part is loaded or given up
 
 
@@ -174,10 +193,13 @@ def load_run(run_id: int, conn=None) -> Loaded:
                             " loaded_at=now()", (run_id, "no_artifacts: " + str(e)[:120]))
             return Loaded(totals, [], False)
         with conn.cursor() as cur:
-            cur.execute("select artifact, status from public.lake_load_log where run_id=%s", (run_id,))
-            logged = dict(cur.fetchall())
+            cur.execute("select artifact, status, extract(epoch from now() - loaded_at) from public.lake_load_log "
+                        "where run_id=%s", (run_id,))
+            got = cur.fetchall()
         conn.rollback()                 # no transaction held open across hours of downloads
-        todo, _ = plan_parts(names, logged)
+        logged = {a: s for a, s, _ in got}
+        age = {a: float(t) for a, _, t in got}          # seconds since each part's last attempt, on the lake's clock
+        todo = [n for n in plan_parts(names, logged)[0] if part_due(logged.get(n), age.get(n, 0.0))]
         # each artifact is loaded (and logged) as soon as it lands, so a slow link or a killed process keeps the
         # progress made so far; the next lake-drive skips what is already loaded. Downloads run in parallel:
         # GitHub's artifact storage serves this Mac at ~12-40 KB/s per connection, so one ~50 MB part at a time
@@ -213,7 +235,9 @@ def load_run(run_id: int, conn=None) -> Loaded:
                 cur.execute("insert into public.lake_load_log(run_id, artifact, files, rows_loaded, status) "
                             "values (%s,%s,0,0,%s) on conflict (run_id, artifact) do update set "
                             "status=excluded.status, loaded_at=now()", (run_id, name, logged[name]))
-            log.warning("run %s %s: download %s: %s", run_id, name, logged[name], why[:200])
+            log.warning("run %s %s: %s: %s", run_id, name, logged[name], why[:200])
+            if fails_of(logged[name]) >= MAX_PART_FAILS:
+                log.warning("run %s %s: given up after %d failures", run_id, name, MAX_PART_FAILS)
             shutil.rmtree(dest / name, ignore_errors=True)
 
         pool = ThreadPoolExecutor(max_workers=DOWNLOAD_PARALLEL)
@@ -223,7 +247,11 @@ def load_run(run_id: int, conn=None) -> Loaded:
                 name = futures[fut]
                 ok, e = fut.result()
                 if ok:
-                    load_one(name)
+                    try:
+                        load_one(name)
+                    except Exception as x:      # a part that won't load counts as a failure: it never blocks the run
+                        conn.rollback()
+                        fail_one(name, f"load {type(x).__name__}: {x}")
                 else:
                     fail_one(name, e)
         finally:
@@ -271,8 +299,10 @@ def window_ranks_of(row) -> List[int]:
 def drive_once(allow_dispatch: bool = True) -> str:
     """One idempotent tick. Returns a one-line summary. Raises nothing the caller must handle (see lake_drive_cli)."""
     summary: List[str] = []
-    if not secrets_ready():
-        return "waiting for secrets (DATABASE_URL not set on the repo)"
+    ready = secrets_ready()
+    if not ready:
+        return ("GitHub unreachable, skipped" if ready is None
+                else "waiting for secrets (DATABASE_URL not set on the repo)")
     lake_up()
     conn = lake_connect()
     try:
@@ -301,11 +331,19 @@ def drive_once(allow_dispatch: bool = True) -> str:
                             "on a.note = 'retry of window ' || b.window_id where b.run_id=%s and a.attempt=2)", (rid,))
                 retried = cur.fetchone()[0]
             if w and res.complete:          # gaps are judged once every part is loaded or given up
-                miss = missing_ranks(conn, window_ranks_of(w))
+                ranks = window_ranks_of(w)
+                # given-up parts count as missing: the fleet may have filled their facts and prices, not their documents
+                miss = sorted(set(missing_ranks(conn, ranks)) | set(gave_up_ranks(ranks, res.gave_up)))
                 act = retry_action(miss, w[4], retried, bool(busy))
                 if act == "dispatch":
-                    new = dispatch("equity-lake.yml", {"from_rank": str(min(miss)), "to_rank": str(max(miss)),
-                                                       "ranks": ranks_str(miss)})
+                    try:
+                        new = dispatch("equity-lake.yml", {"from_rank": str(min(miss)), "to_rank": str(max(miss)),
+                                                           "ranks": ranks_str(miss)},
+                                       title=f"lake {min(miss)}-{max(miss)} (retry)")
+                    except Exception as e:  # e.g. GitHub unreachable: re-open the run, a later drive dispatches it
+                        log.warning("run %s: retry dispatch failed: %s", rid, e)
+                        act = "wait"
+                if act == "dispatch":
                     with conn, conn.cursor() as cur:
                         cur.execute("insert into public.lake_window(from_rank,to_rank,ranks,attempt,run_id,note) "
                                     "values (%s,%s,%s,2,%s,%s)", (min(miss), max(miss), ranks_str(miss), new,
@@ -316,7 +354,7 @@ def drive_once(allow_dispatch: bool = True) -> str:
                     with conn, conn.cursor() as cur:
                         cur.execute("delete from public.lake_load_log where run_id=%s and artifact='__complete__'",
                                     (rid,))
-                    line += f" retry of {len(miss)} ranks waits for the running lake run"
+                    line += f" retry of {len(miss)} ranks deferred to a later drive"
                 else:
                     with conn, conn.cursor() as cur:
                         cur.execute("update public.lake_window set status=%s, loaded_at=now() where window_id=%s",
@@ -359,7 +397,8 @@ def drive_once(allow_dispatch: bool = True) -> str:
             conn.rollback()
             w = next_window(done, WINDOWS + extra_windows(conn))
             if w:
-                rid = dispatch("equity-lake.yml", {"from_rank": str(w[0]), "to_rank": str(w[1])})
+                rid = dispatch("equity-lake.yml", {"from_rank": str(w[0]), "to_rank": str(w[1])},
+                               title=f"lake {w[0]}-{w[1]}")
                 with conn, conn.cursor() as cur:
                     cur.execute("insert into public.lake_window(from_rank,to_rank,run_id) values (%s,%s,%s)",
                                 (w[0], w[1], rid))
@@ -398,8 +437,10 @@ def sync_top100(src, lake_conn) -> int:
 # ───────────────────────────── kick-off ─────────────────────────────
 def lake_start() -> int:
     from .db import DB
-    if not secrets_ready():
-        print("waiting for secrets: DATABASE_URL is not set on the repo; lake-drive will continue when it is")
+    ready = secrets_ready()
+    if not ready:
+        print("GitHub unreachable; lake-drive will continue when it is back" if ready is None else
+              "waiting for secrets: DATABASE_URL is not set on the repo; lake-drive will continue when it is")
         lake_up()
         return 0
     print("lake:", lake_up())
