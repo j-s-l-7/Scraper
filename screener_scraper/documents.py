@@ -35,6 +35,11 @@ MAX_BYTES = 250 * 1024 * 1024
 DOC_INTERVAL = 0.5           # min seconds between requests per worker process (BSE politeness)
 DOC_MAX_INTERVAL = 10.0
 TERMINAL = ("ok", "no_text", "missing")      # skipped on re-run unless force
+# A failed / unreadable document's url is not downloaded again for this long (force overrides). A dead or broken file
+# was otherwise re-fetched on every 10-min fleet pass: JASH AR 2023 (a 91 MB zip) 30 times in 11 h. The stamp is the
+# latest attempts_log entry from either download of the url itself; the fallback chain keeps its own schedule.
+PRIMARY_COOLDOWN_DAYS = 7
+COOLDOWN_SOURCES = ["primary", "original_retry"]
 MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 
@@ -163,7 +168,9 @@ def download(url: str, spacer: Spacer = None, tries: int = 3) -> bytes:
     host = urlparse(url).netloc.lower()
     skipped = _host_skipped(host)
     if skipped:
-        raise FetchError(skipped, None, 0)
+        e = FetchError(skipped, None, 0)
+        e.host_skipped = True                         # nothing was requested: no cooldown stamp (run_company)
+        raise e
     last: Optional[Exception] = None
     for attempt in range(1, tries + 1):
         spacer.wait()
@@ -364,6 +371,17 @@ def _set_status(cur, company_id, doc_type, url, status, **kw) -> None:
                 (*cols.values(), company_id, doc_type, url))
 
 
+def _note_primary(cur, company_id, doc_type, url, result: str) -> None:
+    """Stamp a failed download of the document's own url (attempts_log source 'primary'): run_company then skips the
+    url for PRIMARY_COOLDOWN_DAYS. Only the latest 'primary' entry is kept, so a url that fails every week stays small."""
+    entry = json.dumps([{"source": "primary", "url": url, "result": result[:200],
+                         "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}])
+    cur.execute("""update equity.document d set attempts_log = coalesce(
+                       (select jsonb_agg(e.v order by e.i) from jsonb_array_elements(d.attempts_log) with ordinality e(v, i)
+                        where e.v->>'source' is distinct from 'primary'), '[]'::jsonb) || %s::jsonb
+                   where company_id=%s and doc_type=%s and url=%s""", (entry, company_id, doc_type, url))
+
+
 def process_document(url: str, symbol: str, doc_type: str, label: Optional[str]) -> dict:
     """Download + extract + write one document. Returns {'status', ...fields}. Raises FetchError (transient/blocked)
     and DocNotFound (404); NoTextError / Unreadable are converted to statuses here."""
@@ -404,9 +422,11 @@ class UnsupportedFormat(Exception):
 def sniff_and_unwrap(raw: bytes, url: str, depth: int = 0) -> Tuple[bytes, str]:
     """-> (bytes, fmt) with fmt in pdf|html|docx|pptx|txt. Looks at magic bytes, not the url or content-type."""
     head = raw[:2048]
-    if b"%PDF" in head[:1024]:
+    zipped = raw[:4] == b"PK\x03\x04"
+    # the zip test comes first: a ZIP_STORED archive of a PDF (common for NSE annual reports) has '%PDF' in its first KB
+    if not zipped and b"%PDF" in head[:1024]:
         return raw, "pdf"
-    if raw[:2] == b"PK":
+    if zipped or raw[:2] == b"PK":
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             names = z.namelist()
             if "[Content_Types].xml" in names:
@@ -557,8 +577,9 @@ _SRC_ORDER = {"bse": 0, "nse": 1}
 def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False, limit: Optional[int] = None,
                 hosts: Optional[set] = None) -> dict:
     """Process every document_link of the kind's doc_type for one company. Idempotent: documents already ok
-    (and, unless force, no_text / missing) are skipped. Raises the first transient FetchError AFTER processing
-    everything else so the rule engine can retry the job (finished documents are skipped next time)."""
+    (and, unless force, no_text / missing, and failed ones within PRIMARY_COOLDOWN_DAYS of their last download) are
+    skipped. Raises the first transient FetchError AFTER processing everything else so the rule engine can retry the
+    job (finished documents are skipped next time)."""
     doc_type = DOC_TYPE_OF[kind]
     t0 = time.monotonic()
     with db.trail.cursor() as cur:
@@ -571,14 +592,22 @@ def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False
         cur.execute("select url, period_label, source from equity.document_link where company_id=%s and doc_type=%s "
                     "order by period_label desc nulls last, url", (company_id, doc_type))
         links = cur.fetchall()
-        cur.execute("select url, status from equity.document where company_id=%s and doc_type=%s", (company_id, doc_type))
-        have = dict(cur.fetchall())
+        # cooling: failed, and its url was downloaded (primary or the fallback's original_retry) in the cooldown window
+        cur.execute("""select url, status, status = 'failed' and exists (
+                           select 1 from jsonb_array_elements(attempts_log) e
+                           where e->>'source' = any(%s) and (e->>'at')::timestamptz > now() - make_interval(days => %s))
+                       from equity.document where company_id=%s and doc_type=%s""",
+                    (COOLDOWN_SOURCES, PRIMARY_COOLDOWN_DAYS, company_id, doc_type))
+        rows = cur.fetchall()
+    have = {url: status for url, status, _ in rows}
+    cooling = set() if force else {url for url, _, c in rows if c}
 
     groups: Dict[str, list] = {}
     for url, label, src in links:
         groups.setdefault(label or url, []).append((url, label, source_of(url, src)))
     stats = {"symbol": symbol, "doc_type": doc_type, "links": len(links), "groups": len(groups), "ok": 0,
-             "no_text": 0, "missing": 0, "failed": 0, "skipped": 0, "groups_done": 0, "pages": 0, "chars": 0, "docs": []}
+             "no_text": 0, "missing": 0, "failed": 0, "skipped": 0, "cooling": 0, "groups_done": 0, "pages": 0,
+             "chars": 0, "docs": []}
     transient: Optional[Exception] = None
 
     for key, members in groups.items():
@@ -596,6 +625,12 @@ def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False
             members = [m for m in members if m[2] in hosts]
             if not members:
                 stats["skipped"] += 1
+                continue
+        if cooling:                                  # an alternate url of the same document is still tried
+            members = [m for m in members if m[0] not in cooling]
+            if not members:
+                stats["skipped"] += 1
+                stats["cooling"] += 1
                 continue
         if limit is not None and stats["groups_done"] >= limit:
             break
@@ -618,6 +653,8 @@ def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False
             except FetchError as e:
                 with db.trail.cursor() as cur:
                     _set_status(cur, company_id, doc_type, url, "failed", error=str(e)[:500])
+                    if not getattr(e, "host_skipped", False):
+                        _note_primary(cur, company_id, doc_type, url, f"FetchError: {e}")
                 gt = gt or e
                 stats["failed"] += 1
                 if e.status_code in (403, 429):             # blocked / throttled: stop hammering, let R1/R2 decide
@@ -627,11 +664,14 @@ def run_company(db, company_id: int, run_id: int, kind: str, force: bool = False
             except Exception as e:                           # unexpected: record and move on
                 with db.trail.cursor() as cur:
                     _set_status(cur, company_id, doc_type, url, "failed", error=f"{type(e).__name__}: {e}"[:500])
+                    _note_primary(cur, company_id, doc_type, url, f"{type(e).__name__}: {e}")
                 log.exception("%s %s: unexpected error", symbol, label)
                 continue
             st = res["status"]
             with db.trail.cursor() as cur:
                 _set_status(cur, company_id, doc_type, url, st, **{k: v for k, v in res.items() if k != "status"})
+                if st == "failed":                                  # unreadable
+                    _note_primary(cur, company_id, doc_type, url, res.get("error") or "failed")
             stats[st] += 1
             stats["pages"] += res.get("page_count") or 0
             stats["chars"] += res.get("char_count") or 0

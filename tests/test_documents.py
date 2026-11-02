@@ -3,6 +3,7 @@ import io
 import json
 import zipfile
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -216,3 +217,114 @@ def test_collect_a_run_that_uploaded_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="HTTP 401"))
     with pytest.raises(RuntimeError):
         docs.collect_documents(None, "1", "o/r", dest=tmp_path)
+
+
+# ───────── stored zips; the primary-download cooldown for failed documents ─────────
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def test_stored_zip_holding_a_pdf_is_unwrapped():
+    """NSE annual-report zips are often ZIP_STORED, so the inner PDF's '%PDF' sits in the zip's first KB. That was
+    sniffed as a PDF and the zip bytes went to the extractors (JASH AR 2023: 'unreadable', 30 downloads in 11 h)."""
+    raw = (FIXTURES / "stored_zip_pdf.zip").read_bytes()
+    assert raw[:4] == b"PK\x03\x04" and b"%PDF" in raw[:1024]          # the shape that fooled the old check
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        inner = z.read("AR_JASH_2022_2023.pdf")
+    data, fmt = docs.sniff_and_unwrap(raw, "u")
+    assert fmt == "pdf" and data == inner
+    pages, _ = docs.extract_pages(data)
+    assert "stored zip fixture" in pages[0] and "Directors report" in pages[1]
+
+
+class _Cur:
+    def __init__(self, db):
+        self.db, self.rows = db, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=()):
+        self.db.sql.append((sql, params))
+        self.rows = next((list(v) for k, v in self.db.answers.items() if k in sql), [])
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _DB:
+    """db.trail.cursor() answering by SQL substring; record_task is recorded."""
+    def __init__(self, links, have):
+        self.answers = {"coalesce(nse_symbol": [("AAA",)], "equity.document_link": links, "attempts_log": have}
+        self.sql, self.tasks = [], []
+        self.trail = self
+
+    def cursor(self):
+        return _Cur(self)
+
+    def record_task(self, *a, **k):
+        self.tasks.append((a, k))
+
+    def notes(self):
+        """urls that got a 'primary' attempts_log entry"""
+        return [p[-1] for s, p in self.sql if s.lstrip().startswith("update") and "'primary'" in s]
+
+
+BSE, NSE = "https://www.bseindia.com/a.pdf", "https://archives.nseindia.com/a.zip"
+
+
+def _run(monkeypatch, have, outcome, force=False, hosts=None, links=None):
+    tried = []
+
+    def fake(url, symbol, doc_type, label):
+        tried.append(url)
+        r = outcome(url)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    monkeypatch.setattr(docs, "process_document", fake)
+    db = _DB(links or [(BSE, "Annual Report 2023", "bse"), (NSE, "Annual Report 2023", "nse")], have)
+    try:
+        st = docs.run_company(db, 1, 9, "docs_ar", force=force, hosts=hosts)
+    except Exception as e:          # transient errors are raised after the whole company was processed
+        st = e
+    return tried, db, st
+
+
+def test_a_recently_failed_url_is_not_downloaded_again(monkeypatch):
+    # (url, status, cooling): both members failed within PRIMARY_COOLDOWN_DAYS
+    have = [(BSE, "failed", True), (NSE, "failed", True)]
+    tried, db, st = _run(monkeypatch, have, lambda u: {"status": "ok"})
+    assert tried == [] and st["skipped"] == 1 and st["cooling"] == 1
+    tried, _, _ = _run(monkeypatch, have, lambda u: {"status": "ok"}, force=True)     # --force overrides
+    assert tried == [BSE]
+
+
+def test_cooling_member_is_skipped_but_its_alternate_is_tried(monkeypatch):
+    tried, _, st = _run(monkeypatch, [(BSE, "failed", True)], lambda u: {"status": "ok", "page_count": 3})
+    assert tried == [NSE] and st["ok"] == 1
+
+
+def test_a_failed_download_is_stamped_for_the_cooldown(monkeypatch):
+    from screener_scraper.http import FetchError
+    unreadable = {"status": "failed", "error": "unreadable document: PdfReadError"}
+    tried, db, st = _run(monkeypatch, [], lambda u: unreadable if u == BSE else FetchError("HTTP 503", 503, 3))
+    assert tried == [BSE, NSE] and db.notes() == [BSE, NSE]
+    assert isinstance(st, FetchError)                       # still raised for the rule engine / retry
+
+    def skipped(u):                                         # the host breaker made no request: no stamp
+        e = FetchError("host skipped", None, 0)
+        e.host_skipped = True
+        return e
+    tried, db, _ = _run(monkeypatch, [], skipped)
+    assert tried == [BSE, NSE] and db.notes() == []
+
+
+def test_an_old_failure_is_retried(monkeypatch):
+    tried, db, st = _run(monkeypatch, [(BSE, "failed", False)], lambda u: {"status": "ok"})
+    assert tried == [BSE] and st["ok"] == 1 and db.notes() == []
