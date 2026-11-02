@@ -268,7 +268,9 @@ def main(argv=None) -> int:
             from .documents import collect_documents
             r = collect_documents(db, a.run_id, a.repo)
             print(r)
-            return 1 if r["missing"] else 0
+            # collected: exit 0 so refresh.sh records the run. `missing` counts the whole catalogue, which no single
+            # run can fix; gating on it re-downloaded every run's artifacts every tick. Download failures still raise.
+            return 0
         elif a.cmd == "load-documents":
             from .documents import load_documents
             print(load_documents(db, a.limit))

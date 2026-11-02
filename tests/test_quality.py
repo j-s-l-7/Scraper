@@ -1,5 +1,6 @@
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import psycopg2
 import pytest
@@ -38,6 +39,8 @@ def test_ohlc():
     bad2 = ("B", d(2025, 1, 2), 10, 12, 11, 11.5)       # open below low
     out = Q.check_ohlc([ok, bad, bad2])
     assert [i.key for i in out] == ["B"] and out[0].detail["n_bad"] == 2
+    dec = ("C", d(2025, 1, 1), *map(Decimal, ("10", "9", "8", "9.5")))    # numeric columns arrive as Decimal
+    assert [i.key for i in Q.check_ohlc([dec])] == ["C"]
 
 
 def test_returns_ignore_splits():

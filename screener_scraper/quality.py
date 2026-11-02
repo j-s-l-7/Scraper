@@ -106,6 +106,7 @@ def check_ohlc(rows: Iterable[Tuple[str, date, float, float, float, float]]) -> 
         vals = [v for v in (o, h, l, c) if v is not None]
         if len(vals) < 4:
             continue
+        o, h, l, c = map(float, vals)          # numeric columns arrive as Decimal; float * Decimal raises
         eps = 1e-6 + 1e-6 * h
         if l > h + eps or o > h + eps or c > h + eps or o < l - eps or c < l - eps:
             per[sym].append(d.isoformat())
