@@ -142,9 +142,12 @@ a scorecard: `equity.dq_issue`, `dq_daily`, `dq_company_score`, `v_quality_summa
 .venv/bin/python -m console --build    # force npm ci + build;  --dev runs next dev on :3000 with the API on :8787
 .venv/bin/python -m library.index      # update the document search index (incremental)
 ```
-A read-only internal app (spec: `ARCHITECTURE.md` §9). Pages: Securities (all 1000 from the lake; `CONSOLE_DB=supabase`
+A read-only internal app (spec: `ARCHITECTURE.md` §9). Pages: Securities (every ranked company from the lake; `CONSOLE_DB=supabase`
 shows the Supabase top 100 instead), Company (`/company/?s=TCS`, 7 tabs), Reader, Library search, and Ops (rollout progress
-by rank band, Mac workers, GitHub wave loading, Supabase size, document completeness, job queue, failures).
+by rank band to the deepest ranked company, Mac workers, GitHub wave loading, Supabase size, document completeness, job queue,
+failures). Ops opens with a storage banner (MB left before writers pause at `storage_limit_mb`, pause reason, lake-primary marker), flags workers silent
+over the watchdog's 60 min, and adds public-source coverage (refreshed in the background, slow view) and the latest
+data-quality day against the one before. Each panel loads on its own: a failed one shows an inline error and its last good value.
 Shortcuts: `/`, `g s`, `g l`, `g o`, `t`, `?`.
 
 ## Storage

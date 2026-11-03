@@ -268,6 +268,10 @@ The GitHub workflow `equity-workers.yml` (workflow_dispatch, input `runners` def
 An internal, local-only app for browsing every security and document, and inspecting data quality.
 **One command:** `.venv/bin/python -m console` builds or serves the app on http://127.0.0.1:8787. It binds to localhost only and
 is **read-only**: it never writes to `equity.*`.
+The Ops page loads each section independently (`_section` in `console/api/app.py`): a failed query yields an `errors` entry and
+the last good value, not a 500. It shows storage headroom and the overflow state (`control.paused`, lake `top100_primary`),
+fleet pause and per-worker log silence, rank bands past 1000, lake data-quality (`dq_daily`), and `v_source_coverage`, which is
+slow and so is computed only by the warm loop (every ~15 ticks, 180 s timeout) and served from memory.
 
 ### Library (`library/`, ported from rebirth-assistant `backend/app/docs/`, same author)
 * `library/chunk.py`: rebirth's `chunk.py` ported as is. Chunks are an exact partition of the page text, cut at ranked break
