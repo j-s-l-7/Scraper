@@ -7,14 +7,6 @@ Scraping, fetching and storing Indian equity data for the **top 100 companies by
 into Supabase Postgres, schema **`equity`**. The same Supabase project also has a separate `mf` (mutual fund)
 schema that belongs to another app. **Never read, write, or join to `mf` from here.**
 
-| source | what | code |
-|---|---|---|
-| screener.in | 12y annual + quarterly statements, drill-down breakdowns, ratios, CAGR boxes, shareholding (category + holder), PE/PBV/EV history, document links | `screener_scraper/` (`scrape`) |
-| yfinance | daily OHLCV since listing, granular statement line items, dividends/splits, shares outstanding, analyst estimates, earnings surprises | `screener_scraper/yf.py` (`yf`), `ingestion/ingest_yfinance.py` |
-| NSE bhavcopy | authoritative daily OHLCV (≥ 2024-07-08) | `ingestion/backfill_from_nse.py` |
-| NSE corporate actions | fallback when yfinance has none | `yf.py` |
-| BSE / NSE filings | annual report + concall transcript full text (per page) | `screener_scraper/documents.py` (`docs`), `ingestion/ingest_concalls.py` (legacy) |
-
 ### Public sources (local lake only, `screener_scraper/sources/`, migrations `sql/090-097`)
 `python -m screener_scraper sources --only X [--backfill-from YYYY-MM-DD]` (X: nse_bhav_full, bse_bhav, bulk_block,
 fo_bhav, credit_ratings, macro, gdelt_news); `refresh.sh` runs `sources --daily`, gated by `equity.control` key
@@ -39,11 +31,6 @@ scripts/overnight.sh                                    # full unattended refres
 python3 -m unittest discover tests
 python3 scripts/validate_system.py                      # price-table preflight
 ```
-
-## Automation (GitHub Actions; secret `DATABASE_URL`)
-- `daily-prices.yml`: Mon–Fri 17:00 IST. yfinance 5d, then NSE bhavcopy `--keep-adj-close`, for Nifty 50 ∪ TOP100_MCAP.
-- `equity-workers.yml`: queue workers (screener + yf) on 5 runners, one IP each. Weekly cron Sat 20:30 UTC enqueues a batch;
-  the local supervisor also dispatches it.
 
 ## Rules
 1. Every table has a natural PK, and every write is `INSERT … ON CONFLICT DO UPDATE`. Re-runs must never duplicate rows.
