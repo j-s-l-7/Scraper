@@ -19,6 +19,7 @@ import psycopg2.extras
 import psycopg2.pool
 
 from screener_scraper import config
+from screener_scraper.db import is_conn_error
 
 log = logging.getLogger("console.db")
 KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
@@ -77,7 +78,7 @@ def clean(v: Any) -> Any:
 
 
 @contextmanager
-def _conn(target: str):
+def _conn(target: str, timeout_ms: int | None = None):
     pool = _get_pool(target)
     conn = pool.getconn()
     ok = True
@@ -86,10 +87,10 @@ def _conn(target: str):
             raise psycopg2.InterfaceError("connection already closed")
         conn.set_session(readonly=True, autocommit=True)
         with conn.cursor() as cur:  # Supabase's pooler drops startup options, so set the timeout per session
-            cur.execute("set statement_timeout = 60000")
+            cur.execute("set statement_timeout = %d" % int(timeout_ms or 60000))
         yield conn
-    except (psycopg2.InterfaceError, psycopg2.OperationalError):
-        ok = False
+    except psycopg2.Error as e:   # a dead pooled connection can surface as a bare DatabaseError
+        ok = not (is_conn_error(e) or conn.closed)
         raise
     finally:
         try:
@@ -98,29 +99,33 @@ def _conn(target: str):
             pass
 
 
-def query(sql: str, params: tuple | list | dict | None = None, *, raw: bool = False, target: str | None = None) -> list[dict]:
-    """Run a parameterised SELECT; reconnect (twice) on InterfaceError / OperationalError."""
+def query(sql: str, params: tuple | list | dict | None = None, *, raw: bool = False, target: str | None = None,
+          timeout_ms: int | None = None) -> list[dict]:
+    """Run a parameterised SELECT. Connection-level errors reset the pool and retry (3 attempts); SQL errors
+    (incl. statement timeout) raise at once."""
     target = target or default_target()
     last: Exception | None = None
     for attempt in range(3):
         try:
-            with _conn(target) as conn:
+            with _conn(target, timeout_ms) as conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(sql, params)
                     rows = cur.fetchall()
             return rows if raw else [clean(dict(r)) for r in rows]
-        except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+        except psycopg2.Error as e:
+            if not is_conn_error(e):
+                raise
             last = e
             log.warning("db connection problem (%s), retry %d", type(e).__name__, attempt + 1)
-            if attempt == 1:
-                reset_pool(target)
+            if attempt == 0:
+                reset_pool(target)   # one idle connection dead means the rest are too
             time.sleep(0.3 * (attempt + 1))
     assert last is not None
     raise last
 
 
-def one(sql: str, params=None, *, target: str | None = None) -> dict | None:
-    rows = query(sql, params, target=target)
+def one(sql: str, params=None, *, target: str | None = None, timeout_ms: int | None = None) -> dict | None:
+    rows = query(sql, params, target=target, timeout_ms=timeout_ms)
     return rows[0] if rows else None
 
 
