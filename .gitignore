@@ -39,6 +39,8 @@ data/.collected_runs
 data/.refresh.lock
 data/.no-autosync
 data/lake/
+# worker pid files and the pause flag (scripts/local-fleet.sh)
+data/fleet/
 reports/
 console/web/node_modules/
 console/web/.next/
