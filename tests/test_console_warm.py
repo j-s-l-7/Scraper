@@ -18,7 +18,7 @@ from console.api import app as A  # noqa: E402
 class WarmOnlyWhileUsed(unittest.TestCase):
     def setUp(self):
         self.loaders = {}
-        for name in ("companies", "_load_securities", "doc_catalog", "_load_ops", "_load_rollout"):
+        for name in ("companies", "_load_securities", "doc_catalog", "_load_ops", "_load_rollout", "_load_sources"):
             p = mock.patch.object(A, name)
             self.loaders[name] = p.start()
             self.addCleanup(p.stop)

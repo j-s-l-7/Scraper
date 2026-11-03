@@ -15,7 +15,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -648,7 +648,8 @@ def library_search(q: str = Query("", max_length=300), symbols: str | None = Non
 @app.get("/api/ops")
 def ops():
     with _ops_lock:  # one slow Supabase load at a time; concurrent requests wait for it, not for a connection each
-        out = db.cached("ops", _load_ops, ttl=OPS_TTL)
+        hit = db._cache.get("ops")
+        out = db.cached("ops", _load_ops, ttl=30.0 if hit and hit[1].get("errors") else OPS_TTL)   # retry a failed section soon
     return {**out, "library": library_stats()}
 
 
@@ -661,8 +662,9 @@ with u as (
     select company_id, rank from equity.universe
     where universe_code = 'TOP1000_MCAP' and as_of = (select max(as_of) from equity.universe where universe_code = 'TOP1000_MCAP')
 )
-select case when rank <= 100 then 1 when rank <= 400 then 101 when rank <= 700 then 401 else 701 end as band,
-       count(*) as total,
+select case when rank <= 100 then 1 when rank <= 400 then 101 when rank <= 700 then 401 when rank <= 1000 then 701
+            else 1001 + (rank - 1001) / 300 * 300 end as band,
+       count(*) as total, max(rank) as hi,
        count(*) filter (where exists (select 1 from equity.financial_fact f join equity.metric m using (metric_id)
                                       where f.company_id = u.company_id and m.source = 'screener' and m.section = 'profit-loss')) as screener,
        count(*) filter (where exists (select 1 from equity.financial_fact f join equity.metric m using (metric_id)
@@ -701,25 +703,84 @@ def _fleet() -> list[dict]:
         log = ROOT / "logs" / f"fleet_{name}.log"
         mtime = log.stat().st_mtime if log.exists() else None
         out.append({"name": name, "alive": alive, "last": _tail(log),
-                    "last_at": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None})
+                    "last_at": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None,
+                    "idle_min": round((time.time() - mtime) / 60, 1) if mtime else None})   # the watchdog restarts at 60
     return out
 
 
+_last_good: dict[str, Any] = {}   # last successful value per Ops section, served stale when its loader fails
+_slow: dict[str, dict] = {}       # slow lake panels computed by the warm loop only: {name: {"value", "at", "error"}}
+
+
+def _section(name: str, fn: Callable[[], dict], errors: dict) -> dict:
+    """Run one independent loader: on success remember it, on failure note the error and serve the last good value."""
+    try:
+        _last_good[name] = v = fn()
+        return v
+    except Exception as e:
+        errors[name] = f"{type(e).__name__}: {str(e)[:200]}"
+        return _last_good.get(name, {})
+
+
 def _load_rollout() -> dict:
-    """Top-1000 coverage by rank band and GitHub wave loading, both from the local lake."""
-    cov = {r["band"]: r for r in db.query(_COVERAGE_SQL, target="lake")}
-    bands = [{"from": a, "to": b, **{k: cov.get(a, {}).get(k, 0) for k in ("total", "screener", "yf", "ar", "cc")}}
-             for a, b in BANDS]
-    runs = db.query(
-        """select run_id,
-                  count(*) filter (where status = 'loaded' and artifact like 'lake-%%') as parts_loaded,
-                  coalesce(sum(rows_loaded) filter (where artifact like 'lake-%%'), 0) as rows_loaded,
-                  bool_or(artifact = '__complete__') as complete,
-                  max(loaded_at) as last_at
-           from public.lake_load_log group by run_id
-           having count(*) filter (where status = 'loaded' and artifact like 'lake-%%') > 0
-           order by max(loaded_at) desc limit 6""", target="lake")
-    return {"bands": bands, "runs": runs, "as_of": datetime.now().isoformat(timespec="seconds")}
+    """Rank-band coverage (to the deepest ranked company), wave loading, lake-primary marker and data quality, all
+    from the local lake. Each section fails alone."""
+    errors: dict = {}
+
+    def bands():
+        cov = {r["band"]: r for r in db.query(_COVERAGE_SQL, target="lake")}
+        ks = ("total", "screener", "yf", "ar", "cc")
+        out = [{"from": a, "to": b, **{k: cov.get(a, {}).get(k, 0) for k in ks}} for a, b in BANDS]
+        out += [{"from": a, "to": min(a + 299, cov[a]["hi"]), **{k: cov[a][k] for k in ks}} for a in sorted(cov) if a > 1000]
+        return {"bands": out}
+
+    def runs():
+        return {"runs": db.query(
+            """select run_id,
+                      count(*) filter (where status = 'loaded' and artifact like 'lake-%%') as parts_loaded,
+                      coalesce(sum(rows_loaded) filter (where artifact like 'lake-%%'), 0) as rows_loaded,
+                      bool_or(artifact = '__complete__') as complete,
+                      max(loaded_at) as last_at
+               from public.lake_load_log group by run_id
+               having count(*) filter (where status = 'loaded' and artifact like 'lake-%%') > 0
+               order by max(loaded_at) desc limit 6""", target="lake")}
+
+    def primary():
+        r = db.one("select value, updated_at from public.lake_state where key = 'top100_primary'", target="lake")
+        return {"top100_primary": r}
+
+    def dq():
+        rows = db.query("select as_of, companies, avg_overall, avg_coverage, avg_freshness, avg_consistency, avg_documents, "
+                        "open_errors, open_warns, by_check, resolved, remediations from equity.dq_daily "
+                        "order by as_of desc limit 2", target="lake")
+        if not rows:
+            return {"dq": None}
+        cur, prev = rows[0], (rows[1] if len(rows) > 1 else None)
+        checks = sorted((cur["by_check"] or {}).items(), key=lambda kv: -kv[1])[:6]
+        same = prev and prev["companies"] == cur["companies"]   # a grown universe is not a like-for-like change
+        delta = {k: round(cur[k] - prev[k], 2) for k in (("avg_overall", "open_errors", "open_warns", "resolved") if same else ()) + ("companies",)
+                 if prev and cur[k] is not None and prev[k] is not None}
+        return {"dq": {**{k: v for k, v in cur.items() if k != "by_check"}, "top_checks": checks, "delta": delta,
+                       "prev_as_of": prev["as_of"] if prev else None}}
+
+    out: dict = {}
+    for name, fn in (("bands", bands), ("runs", runs), ("primary", primary), ("dq", dq)):
+        out.update(_section("rollout_" + name, fn, errors))
+    return {**out, "errors": errors, "as_of": datetime.now().isoformat(timespec="seconds")}
+
+
+def _load_sources() -> list[dict]:
+    """equity.v_source_coverage is slow (one call hit the 60 s statement_timeout): warm loop only, long timeout."""
+    return db.query("select source, rows, min_date, max_date, last_loaded, companies from equity.v_source_coverage order by source",
+                    target="lake", timeout_ms=180000)
+
+
+def _warm_sources() -> None:
+    prev = _slow.get("sources", {})
+    try:
+        _slow["sources"] = {"value": _load_sources(), "at": datetime.now().isoformat(timespec="seconds"), "error": None}
+    except Exception as e:
+        _slow["sources"] = {**prev, "error": f"{type(e).__name__}: {str(e)[:200]}"}   # keep the last good rows
 
 
 @app.get("/api/rollout")
@@ -727,46 +788,66 @@ def rollout():
     out = db.cached("rollout", _load_rollout, ttl=120.0)
     logs = sorted((ROOT / "logs").glob("lake_drive_*.log"))
     loader = {"running": (ROOT / "data" / ".lake-drive.lock").exists(), "last": _tail(logs[-1]) if logs else ""}
-    return {**out, "fleet": _fleet(), "loader": loader}
+    src = _slow.get("sources")   # None until the warm loop has run it once
+    return {**out, "fleet": _fleet(), "fleet_paused": (ROOT / "data" / "fleet" / "paused").exists(), "loader": loader,
+            "sources": {"rows": src.get("value"), "at": src.get("at"), "error": src.get("error")} if src else None}
+
+
 _ops_lock = threading.Lock()
 
 
 def _load_ops() -> dict:
-    # the job queue, storage guard and run log live in Supabase, whatever the data pages read
+    """The job queue, storage guard and run log live in Supabase, whatever the data pages read. Sections load
+    independently: a failed one lands in `errors` (value = last good one, if any) instead of failing the page."""
     def q(sql, params=None):
         return db.query(sql, params, target="supabase")
 
     def o(sql, params=None):
         return db.one(sql, params, target="supabase")
 
-    runs = q("select run_id, command, status, params, stats, host, started_at, finished_at from equity.scrape_run order by run_id desc limit 20")
-    jobs = q("select kind, status, count(*) n from equity.job group by 1, 2 order by 1, 2")
-    job_fail = q("select kind, coalesce(error_class, 'unknown') as error_class, count(*) n from equity.job "
-                 "where status in ('retry','dead') group by 1, 2 order by n desc")
-    task_fail = q("select split_part(task, ':', 1) as task, left(coalesce(error, 'no error text'), 90) as error, count(*) n "
-                  "from equity.scrape_task where status = 'failed' group by 1, 2 order by n desc limit 20")
-    size = o("select pg_database_size(current_database()) as bytes")
-    limit = o("select value from equity.control where key = 'storage_limit_mb'")
-    control = q("select key, value, reason, updated_at from equity.control order by key")
-    tables = q(
-        """select c.relname as name, pg_total_relation_size(c.oid) as bytes, c.reltuples::bigint as est_rows
-           from pg_class c join pg_namespace n on n.oid = c.relnamespace
-           where n.nspname = 'equity' and c.relkind = 'r' order by 2 desc limit 10""")
-    docs = q("select doc_type, status, count(*) n from equity.document group by 1, 2 order by 1, 2")
-    # one pass over the (slow) completeness view, limited to the Supabase top 100; totals and gaps computed here
-    rows = q("select nse_symbol as symbol, ar_expected, ar_found, cc_expected, cc_found, ppt_expected, ppt_found "
-             "from equity.v_document_completeness where company_id in (select company_id from equity.universe "
-             "where universe_code = %s and as_of = (select max(as_of) from equity.universe where universe_code = %s))",
-             ("TOP100_MCAP", "TOP100_MCAP"))
-    keys = ["ar_expected", "ar_found", "cc_expected", "cc_found", "ppt_expected", "ppt_found"]
-    comp = {k: sum(r[k] or 0 for r in rows) for k in keys} | {"companies": len(rows)}
-    gaps = sorted(({"symbol": r["symbol"], "ar_gap": (r["ar_expected"] or 0) - (r["ar_found"] or 0),
-                    "cc_gap": (r["cc_expected"] or 0) - (r["cc_found"] or 0),
-                    **{k: r[k] for k in ("ar_found", "ar_expected", "cc_found", "cc_expected")}} for r in rows),
-                  key=lambda g: g["ar_gap"] + g["cc_gap"], reverse=True)[:12]
-    return {"runs": runs, "jobs": jobs, "job_failures": job_fail, "task_failures": task_fail,
-            "db": {"bytes": size["bytes"], "limit_mb": limit["value"] if limit else 500, "cap_mb": 500, "tables": tables},
-            "control": control, "documents": docs, "completeness": comp, "completeness_gaps": gaps}
+    def runs():
+        return {"runs": q("select run_id, command, status, params, stats, host, started_at, finished_at from equity.scrape_run order by run_id desc limit 20")}
+
+    def queue():
+        return {"jobs": q("select kind, status, count(*) n from equity.job group by 1, 2 order by 1, 2"),
+                "job_failures": q("select kind, coalesce(error_class, 'unknown') as error_class, count(*) n from equity.job "
+                                  "where status in ('retry','dead') group by 1, 2 order by n desc"),
+                "task_failures": q("select split_part(task, ':', 1) as task, left(coalesce(error, 'no error text'), 90) as error, count(*) n "
+                                   "from equity.scrape_task where status = 'failed' group by 1, 2 order by n desc limit 20")}
+
+    def storage():
+        size = o("select pg_database_size(current_database()) as bytes")
+        limit = o("select value from equity.control where key = 'storage_limit_mb'")
+        control = q("select key, value, reason, updated_at from equity.control order by key")
+        tables = q(
+            """select c.relname as name, pg_total_relation_size(c.oid) as bytes, c.reltuples::bigint as est_rows
+               from pg_class c join pg_namespace n on n.oid = c.relnamespace
+               where n.nspname = 'equity' and c.relkind = 'r' order by 2 desc limit 10""")
+        return {"db": {"bytes": size["bytes"], "limit_mb": limit["value"] if limit else 500, "cap_mb": 500, "tables": tables},
+                "control": control}
+
+    def documents():
+        return {"documents": q("select doc_type, status, count(*) n from equity.document group by 1, 2 order by 1, 2")}
+
+    def completeness():
+        # one pass over the (slow) completeness view, limited to the Supabase top 100; totals and gaps computed here
+        rows = q("select nse_symbol as symbol, ar_expected, ar_found, cc_expected, cc_found, ppt_expected, ppt_found "
+                 "from equity.v_document_completeness where company_id in (select company_id from equity.universe "
+                 "where universe_code = %s and as_of = (select max(as_of) from equity.universe where universe_code = %s))",
+                 ("TOP100_MCAP", "TOP100_MCAP"))
+        keys = ["ar_expected", "ar_found", "cc_expected", "cc_found", "ppt_expected", "ppt_found"]
+        comp = {k: sum(r[k] or 0 for r in rows) for k in keys} | {"companies": len(rows)}
+        gaps = sorted(({"symbol": r["symbol"], "ar_gap": (r["ar_expected"] or 0) - (r["ar_found"] or 0),
+                        "cc_gap": (r["cc_expected"] or 0) - (r["cc_found"] or 0),
+                        **{k: r[k] for k in ("ar_found", "ar_expected", "cc_found", "cc_expected")}} for r in rows),
+                      key=lambda g: g["ar_gap"] + g["cc_gap"], reverse=True)[:12]
+        return {"completeness": comp, "completeness_gaps": gaps}
+
+    errors: dict = {}
+    out: dict = {}
+    for name, fn in (("runs", runs), ("queue", queue), ("storage", storage), ("documents", documents), ("completeness", completeness)):
+        out.update(_section("ops_" + name, fn, errors))
+    return {**out, "errors": errors}
 
 
 def _warm_tick(n: int) -> int:
@@ -791,6 +872,8 @@ def _warm_tick(n: int) -> int:
             db.put("rollout", _load_rollout())
         except Exception as e:
             db.log.warning("warm loop (rollout): %s", e)
+    if n % 15 == 0:   # last: it may take minutes and must not hold up the others
+        _warm_sources()
     return n + 1
 
 
