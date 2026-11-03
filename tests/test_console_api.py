@@ -35,7 +35,7 @@ def test_health(client):
 
 def test_securities_list(client):
     j = get(client, "/api/securities")
-    assert j["count"] == 100 and len(j["items"]) == 100
+    assert j["count"] >= 100 and len(j["items"]) == j["count"]   # lake: top 1000+, CONSOLE_DB=supabase: 100
     first = j["items"][0]
     for k in ("rank", "symbol", "name", "sector", "market_cap_cr", "price", "pe", "roe_pct", "roce_pct", "ret_1y", "has_screener", "has_yf", "ar_n", "cc_n"):
         assert k in first
@@ -128,6 +128,14 @@ def test_ops(client):
     j = get(client, "/api/ops")
     assert j["runs"] and j["db"]["bytes"] > 0 and j["db"]["cap_mb"] == 500
     assert j["completeness"]["companies"] == 100 and "library" in j and isinstance(j["jobs"], list)
+    assert isinstance(j["errors"], dict) and any(c["key"] == "paused" for c in j["control"])
+
+
+def test_rollout(client):
+    j = get(client, "/api/rollout")
+    assert j["bands"][0]["from"] == 1 and isinstance(j["fleet_paused"], bool) and isinstance(j["errors"], dict)
+    assert all("idle_min" in f for f in j["fleet"]) and "top100_primary" in j and "sources" in j
+    assert j["dq"] is None or {"avg_overall", "open_errors", "top_checks", "delta"} <= set(j["dq"])
 
 
 def test_spa_fallback_and_redirects(client):
