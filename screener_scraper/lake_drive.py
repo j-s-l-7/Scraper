@@ -32,7 +32,7 @@ REPO = "j-s-l-7/Scraper"
 WINDOWS = [(101, 400), (401, 700), (701, 1000)]
 RUNNERS = 20
 BUSY = {"queued", "in_progress", "waiting", "pending", "requested"}
-DOWNLOAD_PARALLEL = 8              # artifact downloads in flight at once
+DOWNLOAD_PARALLEL = 3              # artifact downloads in flight at once (see load_run: more starve on a slow link)
 DOWNLOAD_TIMEOUT = 3 * 3600        # per artifact; ~50 MB at ~12 KB/s takes ~70 min
 MAX_PART_FAILS = 6                 # a part that failed this often is given up; the window retry covers its ranks
 PART_BACKOFF_S = 900               # after n failures a part waits 15m, 30m, 1h, 2h, 4h: giving up needs >= 7.75h
@@ -229,7 +229,8 @@ def load_run(run_id: int, conn=None) -> Loaded:
         # each artifact is loaded (and logged) as soon as it lands, so a slow link or a killed process keeps the
         # progress made so far; the next lake-drive skips what is already loaded. Downloads run in parallel:
         # GitHub's artifact storage serves this Mac at ~12-40 KB/s per connection, so one ~50 MB part at a time
-        # never finished inside its timeout.
+        # never finished inside its timeout. But the home link can drop to ~70 KB/s in all (3 Nov): 8 transfers
+        # then get ~9 KB/s each, the storage server resets them mid-file and every retry starts from zero.
 
         def fetch(name: str) -> Tuple[bool, str]:
             try:
