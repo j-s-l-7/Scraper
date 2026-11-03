@@ -57,16 +57,19 @@ scripts/local-fleet.sh pause|resume        # each worker stops after its current
 `scripts/refresh.sh` runs every 15 minutes, is idempotent and logs to `logs/refresh_<date>.log`:
 1. collect finished `equity-docs` runs into `data/documents/`
 2. `lake-drive` in the background (own lock): load finished `equity-lake` runs, retry gaps, dispatch the next rank
-   window; daily top-100 sync and `equity-docs`, weekly `equity-shards`
+   window; daily top-100 sync and `equity-docs`, weekly `equity-shards` (both top-100 dispatches stop while the lake is
+   primary, see overflow below)
 3. restart any dead fleet worker
 4. `dq --db both` (once a day); public sources run in the fleet's `sources` worker
 5. `library.index` (incremental) and the batch report
 6. git autosync: commit and push code only when the full test suite passes and no secret-like string is staged;
    `touch data/.no-autosync` pauses it
 
-Fleet workers (`logs/fleet_<name>.log`): `screener` (ranks 1000 down to 101), `yf`, `bse` (BSE-hosted annual reports),
-`nse` (NSE- and other-hosted annual reports), `concalls` (transcripts + presentations, with the fallback chain),
-`sources` (exchange archives).
+Fleet workers (`logs/fleet_<name>.log`): `screener` (every ranked company from rank 101 up, ascending; refreshes a
+company weekly, or within 20 h while its latest quarter is missing), `yf` (to rank 1000; past that, prices come from the
+NSE bhavcopy), `bse` (BSE-hosted annual reports), `nse` (NSE- and other-hosted annual reports), `concalls` (transcripts +
+presentations, with the fallback chain), `sources` (exchange archives). A company is capped at 40 minutes inside a worker,
+and a watchdog in `scripts/local-fleet.sh` restarts a worker whose log has been silent for 60 minutes (stack dumped first).
 
 Safety switches live in `equity.control`: `paused`, `storage_limit_mb` (470, below Supabase's 500 MB cap),
 `openai_audio_budget_usd`, and one `source:<name>` marker per public source per day.
@@ -77,17 +80,30 @@ GitHub Actions (repo secrets `DATABASE_URL`, optional `OPENAI_API_KEY`):
 |---|---|
 | `daily-prices.yml` | Mon–Fri 17:00 IST: yfinance last 5 days, then NSE bhavcopy `--keep-adj-close`, for Nifty 50 ∪ top 100 |
 | `equity-shards.yml` | top-100 screener + yfinance refresh across shards (weekly, dispatched by `lake-drive`) |
-| `equity-docs.yml` | top-100 document text, retrying missing documents (daily, dispatched by `lake-drive`) |
+| `equity-docs.yml` | top-100 document text: primary fetch daily across 10 shards, fallback chain for missing documents at most weekly; dispatched by `lake-drive`, not while the lake is primary |
 | `equity-workers.yml` | job-queue workers on 5 runners (weekly cron) |
 | `equity-rank.yml` | rank every NSE equity by market cap into `TOP1000_MCAP` |
 | `equity-lake.yml` | 20 runners per rank window: scrape + yf + docs per company into a runner-local Postgres, exported as artifacts |
 
-## Top-1000 rollout (local lake)
+## Rollout past the top 100 (local lake)
 `lake-start` ranks NSE (`equity-rank.yml`) and dispatches the first window. From then on `lake-drive` loads each finished
-`equity-lake` run, re-dispatches missing ranks once, and dispatches the next window: 101–400, 401–700, 701–1000, then the
-rest of NSE. Artifacts download 8 at a time (GitHub's storage serves this Mac at ~12–40 KB/s per connection) and each one
-is loaded as it lands, so an interruption keeps the progress. Manual load: `lake-load <run_id>`. Bookkeeping tables:
-`lake_window`, `lake_load_log`, `lake_state`. Progress by rank band: console → Ops → "Top 1,000 rollout".
+`equity-lake` run, re-dispatches missing ranks once, and dispatches the next window. The base windows are 101–400,
+401–700 and 701–1000. Once all three are loaded, the daily `dq` run's `grow_universe` ranks the remaining NSE candidates
+past 1000 into `TOP1000_MCAP` and registers one 300-rank window at a time in `lake_state.extra_windows`, which
+`lake-drive` dispatches, until no candidates remain. Artifacts download 3 at a time (GitHub's storage serves this Mac at
+~12–40 KB/s per connection, and more parallel downloads starve the slow link) and each one is loaded as it lands, so an
+interruption keeps the progress. Manual load: `lake-load <run_id>`. Bookkeeping tables: `lake_window`, `lake_load_log`,
+`lake_state`. Progress by rank band: console → Ops → "Top N rollout" (bands continue to the deepest ranked company).
+
+## When Supabase fills up (overflow)
+When Supabase's size reaches `equity.control.storage_limit_mb` (470 MB, below the 500 MB free-tier cap), the first writer
+to see it latches `control.paused` with a `db_full: ...` reason. Nothing is deleted from Supabase. While the latch holds,
+every top-100 writer skips Supabase (CLI gate on scrape, yf, reparse, docs, load-documents, enqueue, worker, supervise;
+the three ingestion scripts; the Supabase part of `dq`; `daily-prices` exits green). `lake-drive` marks the lake primary
+for the top 100 (`lake_state` key `top100_primary`), stops dispatching `equity-docs` / `equity-shards`, and syncs only
+company/universe rows down; the fleet covers the top 100 too and the library indexes the lake's top 100. Only a human
+clears the latch, after copying the top 100 back; the order is in `.claude/skills/scrape-screener/SKILL.md`. Console →
+Ops shows the MB left before the pause, the pause reason and the lake-primary marker.
 
 ## CLI
 ```bash
@@ -101,7 +117,9 @@ python -m screener_scraper dq       [--db supabase|lake|both] [--force]
 python -m screener_scraper coverage | docs-coverage | status | report
 python -m screener_scraper --help                             # everything else (queue, lake, fleet, rank)
 .venv/bin/python -m unittest discover -s tests -q             # tests (parser fixtures are saved real pages)
+.venv/bin/python -m pytest -q tests/test_console_api.py       # console API: live pytest-style tests, not collected above
 ```
+The console API tests need pytest, a dev install that is not in `requirements.txt`.
 * `scrape` skips a company whose tasks all succeeded in the last 20h (`--force` ignores that and the raw cache). Workers
   share one global rate limiter: >=1.5s plus jitter per IP (`SCREENER_MIN_INTERVAL`, `SCREENER_JITTER`); a 429 doubles the
   interval (cap 10s), which decays after 20 straight successes. About 54 requests and ~2.5 min per company.
@@ -142,26 +160,32 @@ a scorecard: `equity.dq_issue`, `dq_daily`, `dq_company_score`, `v_quality_summa
 .venv/bin/python -m console --build    # force npm ci + build;  --dev runs next dev on :3000 with the API on :8787
 .venv/bin/python -m library.index      # update the document search index (incremental)
 ```
-A read-only internal app (spec: `ARCHITECTURE.md` §9). Pages: Securities (every ranked company from the lake; `CONSOLE_DB=supabase`
-shows the Supabase top 100 instead), Company (`/company/?s=TCS`, 7 tabs), Reader, Library search, and Ops (rollout progress
-by rank band to the deepest ranked company, Mac workers, GitHub wave loading, Supabase size, document completeness, job queue,
-failures). Ops opens with a storage banner (MB left before writers pause at `storage_limit_mb`, pause reason, lake-primary marker), flags workers silent
-over the watchdog's 60 min, and adds public-source coverage (refreshed in the background, slow view) and the latest
-data-quality day against the one before. Each panel loads on its own: a failed one shows an inline error and its last good value.
+A read-only internal app (spec: `ARCHITECTURE.md` §9), local only: http://127.0.0.1:8787 (Ops at
+http://127.0.0.1:8787/ops/), bound to localhost. To view it from another device use an SSH tunnel
+(`ssh -L 8787:127.0.0.1:8787 <mac>`); never bind it publicly (personal, non-commercial data).
+Pages: Securities (every ranked company from the lake; `CONSOLE_DB=supabase` shows the Supabase top 100 instead),
+Company (`/company/?s=TCS`, 7 tabs), Reader, Library search, and Ops (rollout progress by rank band to the deepest
+ranked company, Mac workers, GitHub wave loading, Supabase size, document completeness, job queue, failures).
+Ops opens with a storage banner (MB left before writers pause at `storage_limit_mb`, pause reason, lake-primary
+marker), flags workers silent over the watchdog's 60 min, and adds public-source coverage (refreshed in the
+background, slow view) and the latest data-quality day against the one before. Each panel loads on its own: a failed
+one shows an inline error and its last good value.
 Shortcuts: `/`, `g s`, `g l`, `g o`, `t`, `?`.
 
 ## Storage
-Measured November 2026, with estimates for full coverage:
+Measured 2026-11-03:
 
-| | now | top 1000 complete | all NSE, every year |
-|---|---|---|---|
-| local lake (numbers) | 5.5 GB | ~8 GB | ~11 GB |
-| document text | 1.1 GB | ~3 GB | ~6 GB |
-| search index | 2.2 GB (top 100) | ~20 GB if every document is indexed | ~35 GB if every document is indexed |
-| **total** | **~10 GB** | **~15 GB (~35 GB with full search)** | **~20 GB (~55 GB with full search)** |
+| | now |
+|---|---|
+| local lake (numbers) | 7.5 GB |
+| document text | 4.9 GB |
+| search index | 2.4 GB (top 100) |
+| raw screener cache (`data/raw`) | 272 MB |
+| Supabase | 457 MB of the 500 MB cap |
 
-Growth is about 2–4 GB a year; Supabase stays under its 500 MB cap. Keep the live lake on the internal SSD. Use an
-external drive for nightly backups (and for an archive of original PDFs, if wanted: roughly 150–300 GB), not a USB stick.
+Supabase is close to the 470 MB latch; see "When Supabase fills up (overflow)". Keep the live lake on the internal SSD.
+Use an external drive for nightly backups (and for an archive of original PDFs, if wanted: roughly 150–300 GB), not a
+USB stick.
 
 ## Ground rules
 * Personal, non-commercial research only. Don't redistribute the data.

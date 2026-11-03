@@ -4,7 +4,7 @@ Symbol lists come from Supabase TOP1000_MCAP (SOURCE_DATABASE_URL, read-only). E
 `pause` stops every worker between companies (PAUSE_FLAG) until `resume`.
 
 ONE process per source host so every site sees a single polite client:
-  screener   screener.in, ranks 1000 -> 101 descending (also yields document_link)
+  screener   screener.in, ranks 101 up, ascending (every ranked company; also yields document_link)
   yf         Yahoo, ranks 101-1000
   bse        BSE-hosted annual reports      nse   NSE-hosted (and other-host) annual reports, after BSE was tried
   concalls   concall_transcript + concall_ppt from any host, then the wayback / company-site fallback chain

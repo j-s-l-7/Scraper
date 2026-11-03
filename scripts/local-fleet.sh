@@ -1,7 +1,7 @@
 #!/bin/bash
 # Local fleet: ONE process per source host, writing DIRECTLY to the local lake (Postgres :5433). Symbol lists come
 # from Supabase TOP1000_MCAP (read-only). Usage: scripts/local-fleet.sh [start|stop|pause|resume|status]  (start is idempotent)
-#   screener (screener.in, ranks 1000->101 desc) | yf (Yahoo) | bse (BSE annual reports) | nse (NSE-hosted ARs)
+#   screener (screener.in, ranks 101 up, ascending, every ranked company) | yf (Yahoo) | bse (BSE annual reports) | nse (NSE-hosted ARs)
 #   concalls (transcripts+ppt, any host, fallback chain) | sources (NSE/BSE archives: bhavcopy, deals, F&O)
 # pause: each worker stops after its current company, and start (refresh.sh runs it) starts nothing until resume.
 set -u
