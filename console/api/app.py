@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -57,6 +58,32 @@ async def _lifespan(_app):
 
 
 app = FastAPI(title="Equity Console", docs_url="/api/docs", openapi_url="/api/openapi.json", lifespan=_lifespan)
+
+WARM_IDLE_S = 600.0                  # the warm loop runs only while /api was requested within this many seconds
+_last_api_hit: float | None = None   # time.monotonic() of the latest /api request
+
+
+class _ApiActivity:
+    """Pure ASGI middleware: notes the time of every /api request (responses and errors pass through untouched)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        global _last_api_hit
+        path = scope.get("path", "") if scope["type"] == "http" else ""
+        if path == "/api" or path.startswith("/api/"):
+            _last_api_hit = time.monotonic()
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(_ApiActivity)
+
+
+def api_active(now: float | None = None) -> bool:
+    """Someone is using the console: an /api request within WARM_IDLE_S."""
+    hit = _last_api_hit
+    return hit is not None and (time.monotonic() if now is None else now) - hit < WARM_IDLE_S
 
 
 # --------------------------------------------------------------------------- helpers
@@ -131,8 +158,7 @@ with u as (
 select u.rank, c.company_id, c.nse_symbol as symbol, c.name, c.sector, c.industry, c.has_consolidated,
        s.as_of as snapshot_as_of, coalesce(s.market_cap_cr, u.market_cap_cr) as market_cap_cr, s.price, s.pe,
        s.roe_pct, s.roce_pct, s.high_52w, s.low_52w, s.dividend_yield_pct, g.value_pct as ret_1y,
-       exists (select 1 from equity.financial_fact f join equity.metric m on m.metric_id = f.metric_id
-               where f.company_id = c.company_id and f.basis = case when c.has_consolidated then 'C' else 'S' end and m.section = 'profit-loss') as has_screener,
+       hs.company_id is not null as has_screener,
        exists (select 1 from equity.yf_snapshot y where y.company_id = c.company_id) as has_yf,
        coalesce(d.ar_n, 0) as ar_n, coalesce(d.cc_n, 0) as cc_n, coalesce(d.doc_gaps, 0) as doc_gaps
 from u
@@ -142,6 +168,13 @@ left join lateral (
     select value_pct from equity.growth_summary gs
     where gs.company_id = c.company_id and gs.measure = 'price_cagr' and gs.horizon = '1Y'
     order by (gs.basis = case when c.has_consolidated then 'C' else 'S' end) desc, gs.as_of desc limit 1) g on true
+-- has_screener: one index-only probe of financial_fact's primary key per company. As an EXISTS in the select list the
+-- planner hashed it over a parallel seq scan of the whole table (643 MB on the lake): ~1.2 s, vs ~0.45 s this way.
+left join lateral (
+    select f.company_id from equity.financial_fact f
+    where f.company_id = c.company_id and f.basis = case when c.has_consolidated then 'C' else 'S' end
+      and f.metric_id = any(array(select m.metric_id from equity.metric m where m.section = 'profit-loss'))
+    limit 1) hs on true
 left join docs d on d.company_id = c.company_id
 order by u.rank
 """
@@ -736,29 +769,37 @@ def _load_ops() -> dict:
             "control": control, "documents": docs, "completeness": comp, "completeness_gaps": gaps}
 
 
+def _warm_tick(n: int) -> int:
+    """One round of the warm loop, only while the console is in use (api_active): an idle console runs no queries.
+    Returns the next round number. Endpoints compute on a cache miss, so a cold first request is only slower."""
+    if not api_active():
+        return n
+    try:
+        companies()
+        db.put("securities", _load_securities())
+        doc_catalog()
+    except Exception as e:  # DB asleep, network: try again next round
+        db.log.warning("warm loop: %s", e)
+    if n % 7 == 0:
+        try:
+            with _ops_lock:
+                db.put("ops", _load_ops())
+        except Exception as e:
+            db.log.warning("warm loop (ops): %s", e)
+    if n % 2 == 0:
+        try:
+            db.put("rollout", _load_rollout())
+        except Exception as e:
+            db.log.warning("warm loop (rollout): %s", e)
+    return n + 1
+
+
 def _warm_loop() -> None:
-    """Keep the hot, slow-to-compute payloads fresh so /api/securities is always served from memory."""
-    import time
+    """Keep the hot, slow-to-compute payloads fresh while the console is in use, so /api/securities is served from
+    memory. It used to run around the clock, seq-scanning the lake's financial_fact every 45 s."""
     n = 0
     while True:
-        try:
-            companies()
-            db.put("securities", _load_securities())
-            doc_catalog()
-        except Exception as e:  # DB asleep, network: try again next round
-            db.log.warning("warm loop: %s", e)
-        if n % 7 == 0:
-            try:
-                with _ops_lock:
-                    db.put("ops", _load_ops())
-            except Exception as e:
-                db.log.warning("warm loop (ops): %s", e)
-        if n % 2 == 0:
-            try:
-                db.put("rollout", _load_rollout())
-            except Exception as e:
-                db.log.warning("warm loop (rollout): %s", e)
-        n += 1
+        n = _warm_tick(n)
         time.sleep(45)
 
 
