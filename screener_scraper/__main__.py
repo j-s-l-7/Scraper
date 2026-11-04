@@ -138,7 +138,7 @@ def main(argv=None) -> int:
     ld = sub.add_parser("load-documents", help="bulk-load local jsonl.gz into equity.document_page (needs a bigger DB)")
     ld.add_argument("--limit", type=int)
     so = sub.add_parser("sources", help="public sources -> local lake (nse_bhav_full,bse_bhav,bulk_block,fo_bhav,"
-                                         "credit_ratings,macro,gdelt_news,nsdl_fpi,mospi,amc_portfolio,nse_cm_bhav,adj_factor)")
+                                         "credit_ratings,macro,gdelt_news,nsdl_fpi,mospi,amc_portfolio,nse_cm_bhav,adj_factor,nse_pr)")
     so.add_argument("--only", help="comma separated source names (default: all)")
     so.add_argument("--backfill-from", help="YYYY-MM-DD: per-day backfill from this date (skips days already loaded)")
     so.add_argument("--daily", action="store_true", help="only sources not yet run today (control-row marker); for refresh.sh")
@@ -169,6 +169,15 @@ def main(argv=None) -> int:
     dq = sub.add_parser("dq", help="daily data-quality run: checks, auto-remediation, scorecard (once per day per DB)")
     dq.add_argument("--db", choices=["supabase", "lake", "both"], default="supabase")
     dq.add_argument("--force", action="store_true", help="run even if it already ran today")
+    tj = sub.add_parser("tijori", help="lake: search Tijori Finance for the ledger's open report/transcript gaps "
+                                       "(verified PDFs only; personal use)")
+    tj.add_argument("--limit", type=int, help="companies (by rank)")
+    sub.add_parser("rank-repair", help="unique ranks past 1000 by latest market cap (Supabase + lake); freezes growth")
+    gp = sub.add_parser("gaps", help="lake: run the zero-network source-chain steps, then rebuild the completeness "
+                                     "ledger (equity.data_gap: every absent item with its reason)")
+    gp.add_argument("--no-fill", action="store_true", help="only rebuild the ledger")
+    gp.add_argument("--daily", action="store_true", help="refresh.sh: once a day, after 20:00 (skips otherwise)")
+    gp.add_argument("--full-prices", action="store_true", help="read the whole bhavcopy (default: weekly, else 14 days)")
     rp = sub.add_parser("report", help="write reports/<batch>.md from the job tables")
     rp.add_argument("--batch", required=True)
     a = ap.parse_args(argv)
@@ -177,6 +186,16 @@ def main(argv=None) -> int:
     if a.cmd == "lake-drive":                 # unattended: no Supabase connection needed up front, never fails
         from .lake_drive import lake_drive_cli
         return lake_drive_cli()
+    if a.cmd == "tijori":
+        from .tijori import tijori_cli
+        return tijori_cli(a.limit)
+    if a.cmd == "rank-repair":
+        from .rank import run_rank_repair
+        print(run_rank_repair())
+        return 0
+    if a.cmd == "gaps":                      # lake only: never touches Supabase
+        from .completeness import gaps_cli
+        return gaps_cli(not a.no_fill, a.daily, a.full_prices)
     if a.cmd == "lake-up":
         from .lake import lake_up
         print(lake_up())

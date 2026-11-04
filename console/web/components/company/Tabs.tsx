@@ -5,6 +5,7 @@ import { DocItem, useApi } from "@/lib/api";
 import { byUnit, cr, date, DOC_LABEL, fmt, isNum, pct, rs } from "@/lib/format";
 import { Bar, Empty, ErrorBox, Seg, Skeleton, Stat, StatusPill, TableSkeleton } from "@/components/ui";
 import { Bars, LineChart, StackedBars } from "@/components/Charts";
+import { CompanyCompleteness } from "@/components/Completeness";
 
 function Load<T>({ url, children }: { url: string; children: (d: T) => React.ReactNode }) {
   const { data, error, loading } = useApi<T>(url);
@@ -149,6 +150,7 @@ export function Quality({ sym }: { sym: string }) {
       const c = q.completeness as Record<string, number & string[]> | null;
       return (
         <div className="space-y-4">
+          <CompanyCompleteness sym={sym} />
           <div className="grid gap-4 lg:grid-cols-2">
             <section className="card p-3"><b>Source coverage</b>
               <table className="tbl mt-2"><tbody>{Object.entries(q.coverage || {}).filter(([k]) => !["company_id", "name"].includes(k)).map(([k, v]) => <tr key={k}><td className="l">{k}</td><td className="l tabular-nums">{String(v ?? "–")}</td></tr>)}</tbody></table></section>

@@ -16,7 +16,12 @@ python -m screener_scraper docs --symbols TCS            # annual reports + conc
 python -m screener_scraper coverage                      # per-company source coverage + gap flags
 python -m screener_scraper status                        # recent runs, failed tasks, row counts
 python -m screener_scraper reparse --date YYYY-MM-DD     # rebuild DB rows from the raw cache (no network)
+python -m screener_scraper gaps [--full-prices]          # lake: zero-network source-chain fills + completeness ledger
 ```
+"Why is X missing for company Y?" → `select * from equity.data_gap where company_id=.. and dataset=..` (lake), or
+console → company → Data quality → Completeness. `explained` = the data does not exist (listed recently, no call,
+no trade, no dividend, every source tried); `open` = `next_source` will try it (fleet role for that host). A wrong
+reason is a rule bug in `screener_scraper/completeness.py`: fix it there with a test, never by editing rows.
 
 ## Full refresh (unattended)
 ```bash

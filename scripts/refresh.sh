@@ -59,6 +59,10 @@ scripts/local-fleet.sh start 2>&1 | tail -n 3 || true
 # 1c. data-quality engine: checks + bounded auto-remediation + scorecard; once per day per DB (marker in equity.control)
 "$PY" -m screener_scraper dq --db both 2>&1 | tail -n 2 | cut -c1-400 || true
 
+# 1d. completeness ledger (lake): zero-network source-chain fills, then every absent item with its reason.
+#     `--daily`: once a day, after 20:00 when the evening exchange files are in
+"$PY" -m screener_scraper gaps --daily 2>&1 | tail -n 12 | cut -c1-300 || true
+
 # 2. library index (incremental; skips docs whose file isn't local yet)
 [ -d library ] && "$PY" -m library.index || echo "library index skipped/failed"
 

@@ -11,7 +11,13 @@ schema that belongs to another app. **Never read, write, or join to `mf` from he
 `python -m screener_scraper sources --only X [--backfill-from YYYY-MM-DD]` (X: nse_bhav_full, bse_bhav, bulk_block,
 fo_bhav, credit_ratings, macro, gdelt_news); `refresh.sh` runs `sources --daily`, gated by `equity.control` key
 `source:<name>`. Plain static/official GETs only, >=1s per host, a 401/403/429 or bot-check is final for the run
-(`blocked_on` marker). Coverage: `equity.v_source_coverage`.
+(`blocked_on` marker). Coverage: `equity.v_source_coverage`. `nse_pr` = NSE PR archive (corporate actions, issue size);
+`nse_changes` = NSE symbol/name changes. Tijori documents: `python -m screener_scraper tijori` (verified PDFs only).
+
+### Completeness ledger (lake, ARCHITECTURE.md §13)
+`python -m screener_scraper gaps` runs the zero-network source-chain fills, then rebuilds `equity.data_gap` (every absent
+item with a reason: explained = the data does not exist, open = next_source pending) and `equity.completeness`. An
+expectation or reason change goes in `completeness.py` with a test in `tests/test_completeness.py`.
 
 Full design: **ARCHITECTURE.md**. Project skills in `.claude/skills/`: `scrape-screener` (operations and
 triage), `equity-db` (querying and storing conventions), `ingest-prices`, `ingest-concalls`.
@@ -28,6 +34,7 @@ pauses all writers at `equity.control.storage_limit_mb` (470).
 .venv/bin/python -m screener_scraper universe --top 100
 scripts/overnight.sh                                    # full unattended refresh (queue + supervisor + GH workers)
 .venv/bin/python -m screener_scraper coverage | status | report
+.venv/bin/python -m screener_scraper gaps             # lake: local fills + completeness ledger
 python3 -m unittest discover tests
 python3 scripts/validate_system.py                      # price-table preflight
 ```

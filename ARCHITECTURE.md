@@ -338,3 +338,72 @@ The undocumented `nseindia.com/api` corporate-actions fallback (cookie warming) 
 **Future, licensed item: XBRL reconciliation.** Reconciling Screener's standardised fundamentals to the exchange XBRL
 filings is skipped: there is no free bulk XBRL feed. It needs a licensed NSE/BSE corporate-data feed (or CMIE/C-MOTS)
 if the use ever turns commercial.
+
+## 13. Completeness ledger and source chains (`screener_scraper/completeness.py`, migrations `sql/108-109`)
+Goal: every expected item for every ranked company (all of `TOP1000_MCAP`, 2,618 companies; growth frozen by
+`rank-repair`) is either present or absent **with a reason**. `python -m screener_scraper gaps` (lake only, never
+Supabase) runs the zero-network chain steps, then rebuilds the ledger from evidence already in the lake (~35 s).
+`refresh.sh` runs it once a day after 20:00 (`gaps --daily`).
+
+**Expectation rules** (pure functions, `tests/test_completeness.py`). The listing date comes from the exchange
+archives' first sightings by ISIN: a sighting in NSE's first file (Jan 2010) means "listed before 2010"; one in BSE's
+first file (Dec 2016) only bounds it, so an earlier NSE date wins and a later one is a move from BSE (INDTONER).
+Daily prices use the NSE listing date (the series is NSE's). Items outside the expectation are not counted.
+
+| dataset | expected items | absent-item reasons |
+|---|---|---|
+| annual_report | FY2013 (start of the screener/BSE links) .. latest FY whose AGM deadline + 1 month has passed, from the first FY filed as a listed company (listed before that FY's AGM deadline) | listed_recently, suspended, queued, dead_link, download_failed, scanned_no_text, no_link, exhausted |
+| concall_transcript | quarters from the first call on record (calls are voluntary) to the last quarter whose results + 15 days are due | no_concalls, deck_only (a deck alone does not prove a call), call_held_no_transcript (recording or notes on record), no_call_that_quarter, queued, the document reasons |
+| concall_ppt | every linked deck | document reasons |
+| fin_quarterly / fin_annual / shareholding | screener's window (13 Q / 12 FY / 12 Q) ending at the later of the last due period (LODR 33: 45 days, 60 for the year; LODR 31: 21 days) and the newest one published; SME boards: half-years only | listed_recently, suspended, missing_in_source (present in yfinance counts as present) |
+| prices | NSE sessions (calendar = bhavcopy days) from the NSE listing or 2010 to the last NSE session | no_trade (exchange record shows no trade after the fill), suspended |
+| dividends | fiscal years with screener Dividend Payout % > 0: an ex-date between the year's start and 9 months after its end | no_dividends, no_record, exhausted (yfinance and the NSE archive both read) |
+| shares_outstanding, bse_code | one per company | exhausted, not_on_bse, fillable |
+
+**Source chains** (`CHAINS`; `:local` steps run inside `gaps`, set-based SQL):
+* prices: yfinance → NSE bhavcopy (local; sessions mapped to the current symbol through ISIN renames). The basis is
+  measured, not assumed: yfinance close / adj_close over the raw exchange close on the nearest overlapping session
+  (≤ 45 days) before and after, carried across any factor in between; no overlap → `adj_factor` alone. A filled row
+  still stepping > 40% against a yfinance neighbour (a demerger or consolidation the factors don't know) is deleted and
+  kept in `equity.price_fill_reject` (ledger reason `basis_conflict`). Rows carry `historical_prices.source =
+  'nse_bhavcopy:fill'`; only those are ever updated by the fill (rule 7), and a trigger (sql/113) hands a filled row
+  to any other writer that updates it. 8 symbol chunks, one transaction each; full pass weekly (~4 min), else 14 days.
+  Audit 2026-11-04: steps > 40% at fill boundaries fell from 320 (73 symbols, factor-only basis) to 5.
+* dividends / splits / bonuses / rights: yfinance → NSE PR archive (`sources --only nse_pr`: `Bc*.csv` purposes parsed by
+  `parse_purpose` into `corporate_action` source `nse_archive`; an event within 3 days of one another source already has
+  is skipped) → `adj_factor` recomputed (NSE dividends pair with the raw NSE close).
+* shares outstanding: yfinance → NSE PR archive issue size (`mcap*.csv`, `equity.nse_issue_size` change log) → screener
+  Equity Capital / Face Value.
+* BSE code: screener → BSE bhavcopy ISIN.
+* documents: screener link → original → retry → Wayback → Common Crawl → company site → OCR / capped audio (unchanged),
+  plus ledger-driven company-site discovery (`fallback.discover_ledger`, run by the `concalls` fleet role, one crawl per
+  company): annual reports no source links and calls on record without a transcript. Each search appends to
+  `data_gap.attempts` (7/14/28-day backoff); after 3 fruitless searches the gap is `exhausted`. A site that answers
+  403 or a bot check is recorded as refusing automated access (final, per the ground rules).
+
+**Third-party document sources (checked 2026-11-04 by research agents; evidence in the session scratchpad).**
+* **Tijori Finance** (`screener_scraper/tijori.py`, `python -m screener_scraper tijori [--limit N]`, also run per company
+  by the `concalls` role before the company-site search): robots.txt allows all; its Terms allow copying/storing for
+  personal, non-commercial use (no redistribution). Company pages are server-rendered and link company-published PDFs
+  on `files.tijorifinance.com` (an S3-style host whose robots.txt 403 is read as "no restrictions", RFC 9309
+  2.3.1.3). A company maps to a page only by an exact name -> slug match (current or former name, NSE
+  `namechange.csv`); a file's quarter comes from its name (quarter-end month, sometimes the call month) and every PDF
+  must prove itself from its text before it is stored (`fetch_source='tijori'`): the company's name phrase in the
+  title block with no group company ahead of it (ICICI Prudential's call sat on ICICI Bank's page), the document kind,
+  and the quarter or fiscal year. One page GET per company; PDFs only for open gaps; 2 s per host; retried monthly.
+  Segment / KPI history is premium (paywall) and not requested.
+* **Trendlyne: not used.** Its Terms (s6) forbid storing its information "in a searchable, machine-readable database"
+  without written permission, its document links sit behind a robots-disallowed `/get-document/` proxy, and its
+  transcript history starts in 2022. Its dividend tables would match the BSE-era gaps, which the yfinance `.BO` step
+  covers instead.
+* **NSE rename files** (`sources --only nse_changes`): `content/equities/symbolchange.csv` and `namechange.csv` ->
+  `equity.nse_symbol_change`, `equity.nse_name_change` (a symbol change can be a merger with a new ISIN: confirm by ISIN).
+
+**Tables.** `equity.data_gap` (company, dataset, period; state open|explained, reason, detail, next_source, attempts,
+first_seen), `equity.completeness` (company x dataset: expected, present, explained, open), `equity.completeness_daily`
+(universe totals + reason counts per day). Console: Ops → "Dataset completeness"; Company → Data quality → "Completeness"
+(every absent item with its reason, next source and evidence); Securities → "Complete" column (mean over datasets of
+(present + explained) / expected). API: `/api/completeness`, `/api/securities/{sym}/gaps`.
+
+**Ranks.** `rank-repair` (idempotent) froze growth (`lake_state.growth_frozen`) and re-ranked everything past 1000 by
+latest market cap: growth had handed out ranks 1001-1799 twice (2,618 companies, 1,915 distinct ranks).

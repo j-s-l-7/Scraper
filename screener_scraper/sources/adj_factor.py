@@ -74,7 +74,7 @@ def sync_from_supabase(db) -> dict:
 
 def compute_factors(db) -> int:
     with db.conn.cursor() as cur:
-        cur.execute("""select co.nse_symbol, a.action_type, a.ex_date, a.value,
+        cur.execute("""select co.nse_symbol, a.action_type, a.ex_date, a.value, a.source,
                               (select b.close from equity.nse_bhav_full b where b.symbol = co.nse_symbol and b.series = 'EQ'
                                  and b.date < a.ex_date order by b.date desc limit 1) as prev_close,
                               (select h.close from equity.historical_prices h where h.symbol = co.nse_symbol
@@ -84,12 +84,27 @@ def compute_factors(db) -> int:
         rows = cur.fetchall()
     db.conn.commit()
     out = []
-    for sym, kind, ex, val, pc, pcy in rows:
-        f = factor_for(kind, float(val) if val is not None else None, float(pcy if pcy is not None else pc) if (pc or pcy) else None)
-        if f is not None and 0 < f < 1.0000001:
+    for sym, kind, ex, val, src, pc, pcy in rows:
+        # yfinance dividends are split-adjusted (pair with yfinance's close); NSE-archive dividends are as declared
+        # (pair with the raw NSE close)
+        close = (pc if pc is not None else pcy) if src == "nse_archive" else (pcy if pcy is not None else pc)
+        f = factor_for(kind, float(val) if val is not None else None, float(close) if close else None)
+        # a consolidation (reverse split, value < 1) raises earlier prices: factor > 1, allowed for splits only
+        if f is not None and (0 < f < 1.0000001 or (kind == "split" and 1 < f <= 100)):
             out.append((sym, ex, f, kind, "computed:corporate_action"))
-    return c.upsert(db, "equity.adj_factor", ["symbol", "ex_date", "factor", "kind", "source"],
-                    ["symbol", "ex_date", "kind"], out, ts_col="fetched_at")
+    n = c.upsert(db, "equity.adj_factor", ["symbol", "ex_date", "factor", "kind", "source"],
+                 ["symbol", "ex_date", "kind"], out, ts_col="fetched_at")
+    keep = {(s, e, k) for s, e, _, k, _ in out}
+    with db.conn.cursor() as cur:            # a factor whose corporate action is gone (deduplicated, corrected)
+        cur.execute("select symbol, ex_date, kind from equity.adj_factor where source = 'computed:corporate_action'")
+        stale = [r for r in cur.fetchall() if r not in keep]
+    db.conn.commit()
+    if stale:
+        db.run_tx(lambda cur: cur.executemany(
+            "delete from equity.adj_factor where symbol=%s and ex_date=%s and kind=%s and source='computed:corporate_action'",
+            stale))
+        log.info("adj_factor: removed %d factors whose corporate action no longer exists", len(stale))
+    return n
 
 
 def dq_check(db) -> dict:

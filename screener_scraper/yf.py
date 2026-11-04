@@ -460,3 +460,56 @@ def run_yf(db: DB, *, symbols: Optional[List[str]] = None, universe: str = confi
     status = "partial" if stats["companies_failed"] else "success"
     db.finish_run(run_id, status, stats)
     return status
+
+
+# ───────── completeness-ledger step: dividends from a company's BSE-only years ─────────
+BSE_DIV_BATCH = 60            # companies per yf-role pass
+
+
+def bse_dividends(db: DB, run_id: int, limit: int = BSE_DIV_BATCH) -> dict:
+    """Dividends paid while a company traded on BSE only (before its NSE listing), which neither the .NS ticker nor
+    the NSE archive can have. Reads `<bse_code>.BO` actions once per company with open `dividends` gaps whose next
+    source is yfinance_bse (equity.data_gap), adds dividends no source has within 3 days, and records the attempt on
+    every such gap, so the next `gaps` marks what is still absent as tried everywhere."""
+    import yfinance
+    from psycopg2.extras import execute_values
+    with db.trail.cursor() as cur:
+        # Yahoo's BSE tickers are the trading symbol + .BO (FORCEMOT.BO); the numeric scrip code does not resolve
+        cur.execute("""select c.company_id, coalesce(c.nse_symbol, c.bse_code), array_agg(g.period) from equity.data_gap g
+                       join equity.company c using (company_id)
+                       where g.dataset = 'dividends' and g.state = 'open' and g.next_source = 'yfinance_bse'
+                         and coalesce(c.nse_symbol, c.bse_code) is not null
+                         and not exists (select 1 from jsonb_array_elements(g.attempts) e where e->>'source' = 'yfinance_bse')
+                       group by 1, 2 order by 1 limit %s""", (limit,))
+        todo = cur.fetchall()
+    st = {"companies": 0, "dividends": 0}
+    for cid, code, periods in todo:
+        tk = f"{code}.BO"
+        new: List[tuple] = []
+        try:
+            rows = [r for r in action_rows(with_retry(lambda: yfinance.Ticker(tk).actions, f"{tk} actions"), cid)
+                    if r[1] == "dividend"]
+            with db.trail.cursor() as cur:
+                cur.execute("select ex_date from equity.corporate_action where company_id=%s and action_type='dividend'",
+                            (cid,))
+                have = [d for (d,) in cur.fetchall()]
+                new = [(cid, "dividend", d, v, f"BSE ticker {tk}", "yfinance") for _, _, d, v, _, _ in rows
+                       if not any(abs((d - h).days) <= 3 for h in have)]
+                if new:
+                    execute_values(cur, """insert into equity.corporate_action (company_id, action_type, ex_date, value,
+                                           detail, source) values %s on conflict (company_id, action_type, ex_date)
+                                           do update set value = excluded.value, detail = excluded.detail
+                                           where equity.corporate_action.detail = excluded.detail""", new)
+            result = f"{len(rows)} dividends on {tk}, {len(new)} new"
+        except Exception as e:
+            result = f"error {type(e).__name__}: {str(e)[:160]}"
+        with db.trail.cursor() as cur:
+            cur.execute("""update equity.data_gap set attempts = attempts || %s::jsonb, updated_at = now()
+                           where company_id = %s and dataset = 'dividends' and period = any(%s)""",
+                        (json.dumps([{"source": "yfinance_bse", "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                      "result": result}]), cid, list(periods)))
+        st["companies"] += 1
+        st["dividends"] += len(new)
+    if todo:
+        log.info("bse dividends: %s", st)
+    return st

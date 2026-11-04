@@ -154,6 +154,41 @@ def yf_done_today(db: DB, company_id: int) -> bool:
         return cur.fetchone()[0]
 
 
+_POLITE = None                # one fallback.Polite per process: its crawl cache and per-host spacing outlive a pass
+_TIJORI = None                # tijori's own client: 2 s per host
+
+
+def ledger_search(db: DB, company_id: int, run_id: int, st: dict) -> bool:
+    """The completeness ledger's network document steps for this company, cheapest verified source first:
+    tijori.discover_tijori, then fallback.discover_ledger (company site). True when either searched a gap. Never
+    raises: the ledger (sql/108) may not exist yet, and one company's search must not stop the pass."""
+    global _POLITE, _TIJORI
+    from .fallback import Polite, discover_ledger
+    from .tijori import GAP_S, discover_tijori
+    searched = False
+    for name, fn in (("tijori", discover_tijori), ("ledger", discover_ledger)):
+        try:
+            if name == "tijori":
+                from .sources import single_instance
+                with single_instance("tijori") as free:   # a batch `tijori` run is the one Tijori client
+                    if not free:
+                        continue
+                    _TIJORI = _TIJORI or Polite(gap=GAP_S)
+                    r = fn(db, company_id, run_id, _TIJORI)
+            else:
+                _POLITE = _POLITE or Polite()
+                if len(_POLITE.crawl_cache) > 50:      # one entry per company site; a pass visits ~2,600
+                    _POLITE.crawl_cache.clear()
+                r = fn(db, company_id, run_id, _POLITE)
+        except Exception as e:
+            log.warning("%s search for %s failed: %s: %s", name, company_id, type(e).__name__, str(e)[:200])
+            continue
+        st[f"{name}_searched"] = st.get(f"{name}_searched", 0) + r["searched"]
+        st[f"{name}_found"] = st.get(f"{name}_found", 0) + r["found"]
+        searched = searched or r["searched"] > 0
+    return searched
+
+
 def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
     from .documents import run_docs_cli
     from .pipeline import scrape_company
@@ -184,8 +219,12 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
                 yf_company(cid, run_id, db=db)
             else:
                 kinds = ["concall_transcript", "concall_ppt"] if role == "concalls" else ["annual_report"]
-                if not has_links(db, cid, kinds):
-                    st["skipped"] += 1
+                linked = has_links(db, cid, kinds)
+                # concalls also owns company-site searches for the completeness ledger's open gaps (annual reports no
+                # source links, calls on record without a transcript): one crawl per company, one client per site
+                searched = role == "concalls" and ledger_search(db, cid, run_id, st)
+                if not linked:
+                    st["skipped" if not searched else "done"] += 1
                     continue
                 hosts = {"bse": {"bse"}, "nse": {"nse", "other"}}.get(role)
                 dt: dict = {}                  # this company's document counters, recorded into the pass's run
@@ -206,6 +245,12 @@ def run_pass(role: str, index: int, of: int, db: DB, src: DB) -> dict:
             log.warning("[%s] rank %d %s failed: %s: %s", role, rank, sym, type(e).__name__, str(e)[:200])
         finally:
             signal.alarm(0)
+    if role == "yf" and not st.get("paused"):   # completeness-ledger step: dividends from BSE-only years (.BO)
+        try:
+            from .yf import bse_dividends
+            st["bse_dividends"] = bse_dividends(db, run_id)
+        except Exception as e:
+            log.warning("[yf] bse dividends failed: %s: %s", type(e).__name__, str(e)[:200])
     db.finish_run(run_id, "partial" if st["failed"] or st["doc_errors"] or st.get("paused") else "success", st)
     return st
 

@@ -48,6 +48,7 @@ export type Security = {
   snapshot_as_of: string | null; market_cap_cr: number | null; price: number | null; pe: number | null; roe_pct: number | null;
   roce_pct: number | null; high_52w: number | null; low_52w: number | null; dividend_yield_pct: number | null; ret_1y: number | null;
   has_screener: boolean; has_yf: boolean; ar_n: number; cc_n: number; doc_gaps: number;
+  complete_pct: number | null; covered_pct: number | null; open_gaps: number | null;
 };
 export type FinRow = { metric_id: number; name: string; unit: string; values: (number | null)[]; ttm: number | null; children: FinRow[] };
 export type Financials = {

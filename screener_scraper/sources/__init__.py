@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 SOURCES = {"nse_bhav_full": "nse_bhav_full", "bse_bhav": "bse_bhav", "bulk_block": "bulk_block", "fo_bhav": "fo_bhav",
            "credit_ratings": "credit_ratings", "macro": "macro", "gdelt_news": "gdelt_news",
            "nsdl_fpi": "nsdl_fpi", "mospi": "mospi", "amc_portfolio": "amc_portfolio", "nse_cm_bhav": "nse_cm_bhav",
-           "adj_factor": "adj_factor"}
+           "adj_factor": "adj_factor", "nse_pr": "nse_pr", "nse_changes": "nse_changes"}
 EXCHANGE_READY_HOUR_IST = 19      # bhavcopies appear in the evening
 RETRY_MINUTES = 90
 

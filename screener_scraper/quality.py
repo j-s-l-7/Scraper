@@ -728,6 +728,9 @@ def grow_universe(sup_conn, lake_conn) -> str:
     (identity rows only, tiny) and register the next window in lake_state 'extra_windows' for lake-drive to dispatch.
     One window at a time; stops when no candidates remain."""
     code = "TOP1000_MCAP"
+    frozen = rows(lake_conn, "select value from public.lake_state where key='growth_frozen'")
+    if frozen:                      # `rank-repair` sets it: the universe is complete and ranks are final
+        return f"growth frozen ({frozen[0][0]})"
     base = rows(lake_conn, "select from_rank, to_rank, status from public.lake_window where attempt=1 and ranks is null")
     if any(s in ("dispatched", "done") for _, _, s in base):
         return "growth waiting: lake windows still in flight"

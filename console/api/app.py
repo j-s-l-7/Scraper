@@ -38,7 +38,7 @@ SECTIONS = {"screener": SCREENER_SECTIONS, "yfinance": YF_SECTIONS}
 PERIODS = {"A", "Q", "H"}
 RANGES = {"1m": 31, "6m": 183, "1y": 366, "3y": 1096, "5y": 1827, "10y": 3653, "max": None}
 DOC_TYPES = {"annual_report", "concall_transcript", "concall_ppt"}
-SORTS = {"rank", "symbol", "name", "sector", "market_cap_cr", "price", "pe", "roe_pct", "roce_pct", "ret_1y"}
+SORTS = {"rank", "symbol", "name", "sector", "market_cap_cr", "price", "pe", "roe_pct", "roce_pct", "ret_1y", "complete_pct"}
 MAX_POINTS = 1500
 YF_PRIORITY = {
     "yf-income": ["Total Revenue", "Operating Revenue", "Gross Profit", "EBITDA", "EBIT", "Operating Income", "Pretax Income",
@@ -184,11 +184,30 @@ def _load_securities():
     return db.query(_SECURITIES_SQL, (UNIVERSE, UNIVERSE))
 
 
+def _completeness_by_company() -> dict[int, dict]:
+    """Per company from the lake's completeness ledger: `complete_pct` = mean over datasets with expected items of
+    (present + explained) / expected, `covered_pct` = mean of present / expected, `open_gaps` = actionable items.
+    Empty when the ledger has not been built (or this target has no lake)."""
+    try:
+        rows = db.query("""select company_id, round(100 * avg((present + explained)::numeric / expected), 1) as complete_pct,
+                                  round(100 * avg(present::numeric / expected), 1) as covered_pct,
+                                  sum(open) filter (where dataset <> 'prices') as open_gaps
+                           from equity.completeness where expected > 0 group by company_id""", target="lake")
+    except Exception:
+        return {}
+    return {r["company_id"]: r for r in rows}
+
+
 @app.get("/api/securities")
 def securities(sort: str = "rank", desc: bool = False):
     sort = pick(sort, SORTS, "sort", "rank")
 
-    rows = db.cached("securities", _load_securities)
+    def load():
+        comp = _completeness_by_company()
+        blank = {"complete_pct": None, "covered_pct": None, "open_gaps": None}
+        return [{**r, **{k: v for k, v in comp.get(r["company_id"], blank).items() if k != "company_id"}}
+                for r in _load_securities()]
+    rows = db.cached("securities", load)
     if sort != "rank" or desc:
         rows = sorted(rows, key=lambda r: (r.get(sort) is None, r.get(sort) if not isinstance(r.get(sort), str) else r[sort].lower()), reverse=desc)
         if desc:  # keep missing values last when descending
@@ -511,6 +530,63 @@ def quality(sym: str):
         task_summary = db.query("select status, count(*) n from equity.scrape_task where company_id = %s group by status", (cid,))
         return {"symbol": c["symbol"], "coverage": cov, "completeness": comp, "tasks": tasks, "task_summary": task_summary, "missing_docs": missing}
     return db.cached(("quality", c["company_id"]), load)
+
+
+# --------------------------------------------------------------------------- completeness ledger (lake)
+def _catalog() -> dict:
+    from screener_scraper.completeness import CHAINS, DATASET_META, DATASETS, REASONS
+    return {"datasets": [{"dataset": d, "label": DATASET_META[d][0], "unit": DATASET_META[d][1], "chain": CHAINS[d]}
+                         for d in DATASETS],
+            "reasons": {k: {"state": s, "label": l} for k, (s, l) in REASONS.items()}}
+
+
+@app.get("/api/completeness")
+def completeness():
+    """Universe-wide: latest equity.completeness_daily row per dataset, a 30-day trend and the reason catalog."""
+    def load():
+        cat = _catalog()
+        try:
+            rows = db.query("""select as_of, dataset, companies, expected, present, explained, open, reasons
+                               from equity.completeness_daily where as_of > (select max(as_of) from equity.completeness_daily) - 30
+                               order by as_of""", target="lake")
+        except Exception as e:
+            return {**cat, "as_of": None, "summary": [], "trend": {}, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        latest = max((r["as_of"] for r in rows), default=None)
+        by = {r["dataset"]: r for r in rows if r["as_of"] == latest}
+        trend: dict[str, list] = {}
+        for r in rows:
+            e = r["expected"] or 0
+            trend.setdefault(r["dataset"], []).append([r["as_of"], round(100 * (r["present"] + r["explained"]) / e, 2) if e else None])
+        summary = [{**m, **{k: by[m["dataset"]][k] for k in ("companies", "expected", "present", "explained", "open")},
+                    "reasons": dict(sorted((by[m["dataset"]]["reasons"] or {}).items(), key=lambda kv: -kv[1]))}
+                   for m in cat["datasets"] if m["dataset"] in by]
+        return {**cat, "as_of": latest, "summary": summary, "trend": trend}
+    return db.cached("completeness", load, ttl=300.0)
+
+
+@app.get("/api/securities/{sym}/gaps")
+def gaps(sym: str):
+    """One company's completeness per dataset plus every absent item with its reason (equity.data_gap)."""
+    c = company(sym)
+
+    def load():
+        cid = c["company_id"]
+        try:
+            per = {r["dataset"]: r for r in db.query(
+                "select dataset, expected, present, explained, open, computed_at from equity.completeness where company_id = %s",
+                (cid,), target="lake")}
+            items = db.query("""select dataset, period, state, reason, detail, next_source, first_seen, updated_at
+                                from equity.data_gap where company_id = %s
+                                order by dataset, state desc, period desc""", (cid,), target="lake")
+        except Exception as e:
+            return {"symbol": c["symbol"], "datasets": [], "gaps": [], "reasons": {}, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        cat = _catalog()
+        notes = {g["dataset"]: g for g in items if g["period"] == ""}
+        datasets = [{**m, **per.get(m["dataset"], {"expected": 0, "present": 0, "explained": 0, "open": 0}),
+                     "note": notes.get(m["dataset"])} for m in cat["datasets"]]
+        return {"symbol": c["symbol"], "datasets": datasets, "gaps": [g for g in items if g["period"] != ""],
+                "reasons": cat["reasons"]}
+    return db.cached(("gaps", c["company_id"]), load)
 
 
 def _load_pages(path: Path) -> list[dict]:

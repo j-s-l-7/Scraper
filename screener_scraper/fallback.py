@@ -891,3 +891,104 @@ def discover_company(db, company_id: int, run_id: int, po: Optional[Polite] = No
         stats["discovered"] += 1
         log.info("%s: discovered transcript for %s at %s", symbol, qend, url)
     return stats
+
+
+# ───────── ledger-driven discovery: items the completeness ledger expects that no source links ─────────
+LEDGER_MAX_RUNS = 3          # company-site searches per gap before `gaps` marks it exhausted
+
+
+def ledger_runs(attempts) -> int:
+    return sum(1 for a in attempts or () if a.get("source") == "company_site")
+
+
+def ledger_due(attempts, now: Optional[datetime] = None) -> bool:
+    """A gap's next company-site search is due: under LEDGER_MAX_RUNS, and past the 7/14/28-day backoff."""
+    runs = [a for a in attempts or () if a.get("source") == "company_site" and a.get("at")]
+    if len(runs) >= LEDGER_MAX_RUNS:
+        return False
+    if not runs:
+        return True
+    last = max(datetime.fromisoformat(a["at"]) for a in runs)
+    return (now or datetime.now(timezone.utc)) - last >= timedelta(days=RETRY_BACKOFF_DAYS[len(runs) - 1])
+
+
+def _store_discovered(cur, company_id: int, doc_type: str, url: str, label: str, fy: Optional[int],
+                      ddate: Optional[date], r: dict, entry: dict, fetch_source: str = "company_site") -> None:
+    from . import documents as D
+    cur.execute("""insert into equity.document_link (company_id, doc_type, url, title, period_label, source)
+                   values (%s,%s,%s,%s,%s,'other') on conflict do nothing""", (company_id, doc_type, url, label, label))
+    cur.execute("""insert into equity.document (company_id, doc_type, url, period_label, fiscal_year, doc_date, source)
+                   values (%s,%s,%s,%s,%s,%s,'other')
+                   on conflict (company_id, doc_type, url) do update set period_label=excluded.period_label,
+                     fiscal_year=excluded.fiscal_year, doc_date=excluded.doc_date""",
+                (company_id, doc_type, url, label, fy, ddate))
+    D._set_status(cur, company_id, doc_type, url, "ok", **{k: v for k, v in r.items() if k != "status"})
+    cur.execute("update equity.document set fetch_source=%s, fetched_url=%s, attempts_log=%s::jsonb "
+                "where company_id=%s and doc_type=%s and url=%s",
+                (fetch_source, url, json.dumps([entry]), company_id, doc_type, url))
+
+
+def discover_ledger(db, company_id: int, run_id: int, po: Optional[Polite] = None) -> dict:
+    """Company-site search for the ledger's open gaps whose next source is company_site: annual reports no source
+    links, and quarters with a call on record (recording/notes) but no transcript. One crawl per company (cached on
+    `po`), our UA, robots.txt respected, a block is final. Every searched gap gets an attempts entry."""
+    from . import documents as D
+    po = po or Polite()
+    with db.trail.cursor() as cur:
+        cur.execute("""select dataset, period, attempts from equity.data_gap where company_id=%s and state='open'
+                       and next_source='company_site' and dataset in ('annual_report','concall_transcript')""",
+                    (company_id,))
+        todo = [(ds, p, a) for ds, p, a in cur.fetchall() if ledger_due(a)]
+        if not todo:
+            return {"searched": 0, "found": 0}
+        cur.execute("select coalesce(nse_symbol, screener_slug, bse_code), website from equity.company where company_id=%s",
+                    (company_id,))
+        symbol, website = cur.fetchone()
+        cur.execute("select url from equity.document where company_id=%s union select url from equity.document_link "
+                    "where company_id=%s", (company_id, company_id))
+        known = {u for (u,) in cur.fetchall()}
+    notes: list = []
+    cands = [c for c in (cached_crawl(po, website, website, notes) if website else []) if c[0] not in known]
+    blocked = next((n["result"] for n in notes if str(n.get("result", "")).startswith("blocked")), None)
+    used: set = set()
+    found = 0
+    for ds, period, _ in todo:
+        if ds == "annual_report":
+            fy, ddate = int(period[2:]), None
+            label = f"Annual Report {fy} (discovered)"
+            best = best_match(cands, "annual_report", label, fy, None, used)
+        else:
+            qend = date.fromisoformat(period)
+            q, fy = fiscal_quarter(qend)
+            label, ddate = f"Q{q} FY{str(fy)[2:]} (discovered)", qend + timedelta(days=1)
+            scored = [(u, quarter_score(qend, f"{urlparse(u).path} {ctx}")) for u, ctx in cands if u not in used]
+            best = max((s for s in scored if s[1] >= 3), key=lambda s: s[1], default=None)
+        result = ("no website on record" if not website else f"company site refuses automated access ({blocked})"
+                  if blocked and not cands else "no matching document on the company site")
+        if best:
+            url = best[0]
+            try:
+                st, data, _ = po.get(url)
+                if st != 200:
+                    result = f"candidate {url}: http {st}"
+                else:
+                    r = D.process_bytes(data, url, symbol, ds, label)
+                    result = f"candidate {url}: {r['status']}"
+                    if r["status"] == "ok":
+                        entry = {"source": "company_site", "url": url, "at": _now(),
+                                 "result": f"discovered for {period} score {best[1]}"}
+                        with db.trail.cursor() as cur:
+                            _store_discovered(cur, company_id, ds, url, label, fy, ddate, r, entry)
+                        used.add(url)
+                        found += 1
+                        result = f"found {url}"
+            except Blocked as e:
+                result = f"blocked: {e}"
+            except Exception as e:
+                result = f"error {type(e).__name__}: {str(e)[:120]}"
+        with db.trail.cursor() as cur:
+            cur.execute("""update equity.data_gap set attempts = attempts || %s::jsonb, updated_at = now()
+                           where company_id=%s and dataset=%s and period=%s""",
+                        (json.dumps([{"source": "company_site", "at": _now(), "result": result[:240]}]), company_id, ds, period))
+    log.info("%s: ledger discovery searched %d gaps, found %d", symbol, len(todo), found)
+    return {"searched": len(todo), "found": found}

@@ -390,8 +390,10 @@ def process_document(url: str, symbol: str, doc_type: str, label: Optional[str])
 
 
 def process_bytes(raw: bytes, url: str, symbol: str, doc_type: str, label: Optional[str],
-                  t0: Optional[float] = None) -> dict:
-    """Sniff the format (PDF / HTML / DOCX / PPTX / TXT / ZIP of those), extract per-page text, write the file."""
+                  t0: Optional[float] = None, check=None) -> dict:
+    """Sniff the format (PDF / HTML / DOCX / PPTX / TXT / ZIP of those), extract per-page text, write the file.
+    check(pages) -> None to accept, or the reason to reject (status 'rejected', nothing written): third-party
+    copies are verified against their own text before they are stored."""
     t0 = t0 or time.monotonic()
     try:
         data, fmt = sniff_and_unwrap(raw, url)
@@ -409,6 +411,8 @@ def process_bytes(raw: bytes, url: str, symbol: str, doc_type: str, label: Optio
     except Unreadable as e:
         return {**base, "status": "failed", "error": f"unreadable document: {e}"[:500],
                 "extract_s": round(time.monotonic() - t1, 2)}
+    if check is not None and (why := check(pages)):
+        return {**base, "status": "rejected", "error": why, "page_count": len(pages)}
     path = write_text(symbol, doc_type, label, sha, pages)
     return {**base, "status": "ok", "page_count": len(pages), "char_count": sum(len(p) for p in pages),
             "text_path": str(path.relative_to(config.ROOT)), "extractor": extractor,

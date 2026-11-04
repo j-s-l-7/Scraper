@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useApi } from "@/lib/api";
 import { bytes, dateTime, fmt } from "@/lib/format";
 import { Bar, Empty, ErrorBox, Skeleton, StatusPill, TableSkeleton } from "@/components/ui";
+import { CompletenessPanel } from "@/components/Completeness";
 
 type Ops = {   // each section is absent when its loader failed with nothing cached: see `errors`
   errors: Record<string, string>;
@@ -129,6 +130,7 @@ export default function OpsPage() {
     <div className="space-y-4">
       <h1 className="text-[17px] font-semibold">Ops</h1>
       <StorageBanner o={o} r={r} />
+      <CompletenessPanel />
       {rerr && !r ? <ErrorBox error={rerr} /> : r ? <RolloutPanel r={r} /> : <Skeleton h={160} />}
       {error ? <ErrorBox error={error} /> : loading && !o ? <div className="space-y-3"><Skeleton h={80} /><TableSkeleton /></div> : o ? <OpsBody o={o} /> : null}
     </div>

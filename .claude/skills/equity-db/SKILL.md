@@ -33,6 +33,8 @@ is primary for the top 100 too: query the lake for top-100 data.
 | annual report / concall links | `document_link` | links only |
 | concall transcripts | `concalls` | (symbol, fiscal_year, quarter) |
 | per-company source coverage | **`v_coverage`** | |
+| what is missing and why (lake) | **`data_gap`** (reason, state open/explained, next_source, attempts), `completeness`, `completeness_daily` | (company_id, dataset, period) |
+| NSE PR archive (lake) | `nse_corp_action` (raw purposes), `nse_issue_size` (issue size change log) | |
 | run audit trail | `scrape_run`, `scrape_task` | |
 
 ## Conventions

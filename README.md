@@ -29,6 +29,9 @@ This public repo holds **code only**: `.env`, `data/`, `logs/` and `reports/` ar
 | BSE / NSE filings, company sites | annual reports, concall transcripts and presentations as text; fallbacks: Wayback, Common Crawl, company site, OCR, capped audio transcription | `screener_scraper/documents.py`, `fallback.py` (`docs`) |
 | NSE / BSE archives | full-market bhavcopies (back-filled from 2010 NSE / 2016 BSE), F&O bhavcopy, bulk/block deals, adjustment factors | `screener_scraper/sources/` (`sources`) |
 | other public data | credit ratings, macro series, GDELT news, NSDL FPI flows, MOSPI, AMC portfolios | `screener_scraper/sources/` |
+| NSE PR archive | corporate actions (dividend, bonus, split, rights) since 2010, daily issue size and face value | `screener_scraper/sources/nse_pr.py` |
+| Tijori Finance | company-published concall transcripts and annual reports for the ledger's open gaps, each PDF verified against its own text (personal use per its Terms) | `screener_scraper/tijori.py` (`tijori`) |
+| NSE rename files | symbol and company-name changes since 1996 | `screener_scraper/sources/nse_changes.py` |
 
 A source that answers 401/403/429 or shows a bot check is skipped for that run, never worked around.
 
@@ -114,6 +117,8 @@ python -m screener_scraper yf       [--symbols ...] [--universe ...] [--shard k/
 python -m screener_scraper docs     ...                       # documents pipeline for --symbols or a universe shard
 python -m screener_scraper sources  --only X [--backfill-from YYYY-MM-DD] | --daily
 python -m screener_scraper dq       [--db supabase|lake|both] [--force]
+python -m screener_scraper gaps     [--no-fill] [--daily]     # lake: source-chain fills + completeness ledger
+python -m screener_scraper rank-repair                        # unique ranks past 1000; freezes universe growth
 python -m screener_scraper coverage | docs-coverage | status | report
 python -m screener_scraper --help                             # everything else (queue, lake, fleet, rank)
 .venv/bin/python -m unittest discover -s tests -q             # tests (parser fixtures are saved real pages)
@@ -148,6 +153,29 @@ Point-in-time: every change to a fact is kept in `equity.financial_fact_history`
 `select * from equity.v_financials_asof('2026-06-30') where nse_symbol='TCS'` shows what was known on that date.
 Split-, bonus- and dividend-adjusted prices computed from raw NSE closes: `v_prices_adjusted`. Source coverage:
 `v_source_coverage`.
+
+## Completeness: every gap has a reason
+`gaps` (lake, daily after 20:00 from `refresh.sh`) first runs the zero-network steps of each dataset's source chain
+(NSE bhavcopy sessions missing from the daily prices, corporate actions and issue size from the NSE PR archive, BSE
+codes from the BSE bhavcopy, shares from screener's equity capital), then rebuilds `equity.data_gap`. Every item a
+company should have (listing-, fiscal-year- and deadline-aware: annual reports, concalls, decks, quarterly and annual
+results, shareholding, daily prices, dividends, shares, BSE code) is present, **explained** (the data does not exist:
+listed recently, no call held, no trade that session, suspended, no dividend declared, every source tried) or **open**
+(`next_source` says what runs next). The `concalls` fleet role searches company sites for the open documents.
+Design: `ARCHITECTURE.md` §13. Console: Ops → Dataset completeness; Company → Data quality; Securities → Complete.
+
+Ledger of 2026-11-04 (2,618 companies; *accounted* = present + absent with a known reason):
+
+| dataset | expected | present | accounted | main open reasons |
+|---|---|---|---|---|
+| annual reports (FY2013 →, from listing) | 24,101 FY | 97.3% | 97.3% | no link in any source yet, dead links |
+| concall transcripts (from the first call on record) | 41,008 Q | 47.4% | 90.1% | dead links, regular caller's quarter not found, queued |
+| investor decks | 29,935 | 96.8% | 96.8% | dead links |
+| quarterly / annual results | 29,863 Q / 21,305 FY | 99.0% / 99.4% | 99.2% / 99.6% | not in screener yet |
+| shareholding | 28,059 Q | 99.0% | 99.2% | not in screener yet |
+| daily NSE prices (from NSE listing or 2010) | 5.35 M sessions | 96.8% | 100% | (none: every absent session had no trade) |
+| dividends (years with a payout) | 11,612 | 87.3% | 88.0% | paid while BSE-only (yfinance `.BO` step queued) |
+| shares outstanding, BSE code | 2,618 each | 100%, 95.2% | 100%, 100% | |
 
 ## Data quality
 `dq` runs once a day per database: screener ↔ yfinance reconciliation, balance-sheet and cash-flow identities,

@@ -41,6 +41,7 @@ data/.no-autosync
 data/lake/
 # worker pid files and the pause flag (scripts/local-fleet.sh)
 data/fleet/
+data/tijori/
 reports/
 console/web/node_modules/
 console/web/.next/

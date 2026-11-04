@@ -11,6 +11,7 @@ const COLS: Col[] = [
   { k: "rank", label: "#", num: true }, { k: "symbol", label: "Symbol" }, { k: "name", label: "Company" }, { k: "sector", label: "Sector" },
   { k: "market_cap_cr", label: "Mkt cap", num: true }, { k: "price", label: "Price", num: true }, { k: "pe", label: "P/E", num: true },
   { k: "roe_pct", label: "ROE %", num: true }, { k: "roce_pct", label: "ROCE %", num: true }, { k: "ret_1y", label: "1Y %", num: true },
+  { k: "complete_pct", label: "Complete", num: true },
 ];
 
 export default function Securities() {
@@ -89,6 +90,9 @@ export default function Securities() {
                   <td className="num">{fmt(r.roe_pct, 1)}</td>
                   <td className="num">{fmt(r.roce_pct, 1)}</td>
                   <td className={`num ${isNum(r.ret_1y) && r.ret_1y < 0 ? "neg" : ""}`}>{pct(r.ret_1y, 1)}</td>
+                  <td className={`num ${isNum(r.complete_pct) && r.complete_pct < 95 ? "text-warn" : ""}`}
+                    title={isNum(r.complete_pct) ? `accounted ${r.complete_pct}% (present ${r.covered_pct}%) · ${r.open_gaps ?? 0} open items` : "ledger not built"}>
+                    {isNum(r.complete_pct) ? `${r.complete_pct.toFixed(r.complete_pct >= 99.95 ? 0 : 1)}%` : "–"}</td>
                   <td className="l">
                     <span className="flex gap-1">
                       <span className={`pill ${r.has_screener ? "ok" : "bad"}`} title="screener.in financials">scr</span>
